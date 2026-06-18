@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes xmlns="http://camel.apache.org/schema/spring"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://camel.apache.org/schema/spring https://camel.apache.org/schema/spring/camel-spring.xsd">
+
+    <bean name="myBean" type="com.ipaas.test.MyTransformerBean"/>
+
+    <route id="ipaas-test-xml-route">
+        <from uri="timer:ipaasTimer?period=2000"/>
+        
+        <setBody>
+            <constant>iPaaS Platformu Test Mesajidir</constant>
+        </setBody>
+        
+        <log message="[ÖNCE] Bean çağrılmadan önceki ham veri: ${body}"/>
+        
+        <bean ref="myBean" method="processPayload"/>
+        
+        <log message="[SONRA] Bean tarafından işlenen XML çıktısı:\n${body}"/>
+    </route>
+
+</routes>
