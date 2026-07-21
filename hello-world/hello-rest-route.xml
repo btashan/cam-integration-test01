@@ -3,20 +3,20 @@
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
 
-    <!-- 1. REST Servisi Tanımı: GET /hello/hi -->
+    <!-- REST Endpoint Tanımı -->
     <rest path="/hello">
         <get uri="/hi">
             <to uri="direct:hesapla"/>
         </get>
     </rest>
 
-    <!-- 2. İş Mantığı Rotalaması -->
+    <!-- İş Mantığı Rotalaması -->
     <route id="helloHesaplaRoute">
         <from uri="direct:hesapla"/>
-        
-        <!-- Groovy Scripting ile Query Parametrelerini Oku ve Yaş Hesabı Yap -->
-        <transform>
-            <groovy>
+
+        <!-- Groovy Scripting -->
+        <setBody>
+            <script language="groovy"><![CDATA[
                 def isim = request.headers.get("isim")
                 def dogumTarihiStr = request.headers.get("dogumTarihi")
 
@@ -33,14 +33,14 @@
                 return [
                     isim: isim,
                     yas: yas,
-                    mesaj: "Merhaba ${isim}, ${yas} yasindasiniz."
+                    mesaj: "Merhaba " + isim + ", " + yas + " yasindasiniz."
                 ]
-            </groovy>
-        </transform>
+            ]]></script>
+        </setBody>
 
-        <!-- Çıktıyı Otomatik JSON Formatına Dönüştür -->
+        <!-- Otomatik JSON Dönüşümü -->
         <marshal>
-            <json library="Jackson"/>
+            <json/>
         </marshal>
     </route>
 
