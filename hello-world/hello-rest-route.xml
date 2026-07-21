@@ -1,17 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <camel xmlns="http://camel.apache.org/schema/spring">
 
-    <!-- REST Definition -->
+    <!-- REST Endpoint Tanımı -->
     <rest path="/hello">
-        <get uri="/hi">
+        <!-- 'uri' YERİNE 'path' KULLANILMALIDIR -->
+        <get path="/hi">
             <to uri="direct:hesapla"/>
         </get>
     </rest>
 
-    <!-- Route Definition -->
+    <!-- İş Mantığı Rotalaması -->
     <route id="helloHesaplaRoute">
         <from uri="direct:hesapla"/>
 
+        <!-- Groovy Scripting -->
         <setBody>
             <script language="groovy"><![CDATA[
                 def isim = request.headers.get("isim")
@@ -35,6 +37,7 @@
             ]]></script>
         </setBody>
 
+        <!-- Otomatik JSON Dönüşümü -->
         <marshal>
             <json/>
         </marshal>
