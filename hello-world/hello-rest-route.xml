@@ -3,7 +3,6 @@
 
     <!-- REST Endpoint Tanımı -->
     <rest path="/hello">
-        <!-- 'uri' YERİNE 'path' KULLANILMALIDIR -->
         <get path="/hi">
             <to uri="direct:hesapla"/>
         </get>
@@ -15,7 +14,7 @@
 
         <!-- Groovy Scripting -->
         <setBody>
-            <script language="groovy"><![CDATA[
+            <groovy><![CDATA[
                 def isim = request.headers.get("isim")
                 def dogumTarihiStr = request.headers.get("dogumTarihi")
 
@@ -34,7 +33,7 @@
                     yas: yas,
                     mesaj: "Merhaba " + isim + ", " + yas + " yasindasiniz."
                 ]
-            ]]></script>
+            ]]></groovy>
         </setBody>
 
         <!-- Otomatik JSON Dönüşümü -->
