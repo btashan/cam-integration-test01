@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes xmlns="http://camel.apache.org/schema/spring"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+
+    <!-- 1. REST Servisi Tanımı: GET /hello/hi -->
+    <rest path="/hello">
+        <get uri="/hi">
+            <to uri="direct:hesapla"/>
+        </get>
+    </rest>
+
+    <!-- 2. İş Mantığı Rotalaması -->
+    <route id="helloHesaplaRoute">
+        <from uri="direct:hesapla"/>
+        
+        <!-- Groovy Scripting ile Query Parametrelerini Oku ve Yaş Hesabı Yap -->
+        <transform>
+            <groovy>
+                def isim = request.headers.get("isim")
+                def dogumTarihiStr = request.headers.get("dogumTarihi")
+
+                if (!isim || !dogumTarihiStr) {
+                    return [
+                        status: "ERROR",
+                        message: "Lutfen 'isim' ve 'dogumTarihi' (YYYY-MM-DD) parametrelerini girin."
+                    ]
+                }
+
+                def dogumTarihi = java.time.LocalDate.parse(dogumTarihiStr)
+                def yas = java.time.Period.between(dogumTarihi, java.time.LocalDate.now()).years
+
+                return [
+                    isim: isim,
+                    yas: yas,
+                    mesaj: "Merhaba ${isim}, ${yas} yasindasiniz."
+                ]
+            </groovy>
+        </transform>
+
+        <!-- Çıktıyı Otomatik JSON Formatına Dönüştür -->
+        <marshal>
+            <json library="Jackson"/>
+        </marshal>
+    </route>
+
+</routes>
