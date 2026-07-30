@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="
+          http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+          http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+
+    <camelContext id="currencyGroovyPipeline" xmlns="http://camel.apache.org/schema/spring">
+
+
+        <!-- ROTA 1: API Poller & PubSub Publisher -->
+        <route id="pollAndPublishRoute">
+            <from uri="timer:currencyPoller?period=1000"/>
+            
+            <to uri="https://api.frankfurter.dev/v1/latest"/>
+            <convertBodyTo type="java.lang.String"/>
+            
+            <setHeader name="processed_date">
+                <simple>${date:now:yyyy-MM-dd'T'HH:mm:ss.SSSXXX}</simple>
+            </setHeader>
+
+            <setBody>
+                <simple>{"processed_date": "${header.processed_date}", "data": ${body}}</simple>
+            </setBody>
+
+            <convertBodyTo type="java.lang.String"/>
+            <to uri="google-pubsub:sample-integration-env:currency-rates"/>
+            <log message="PubSub'a doviz verisi gonderildi: ${header.processed_date}"/>
+            <log message="PubSub'a doviz verisi gonderildi: ${body}"/>
+        </route>
+
+        <!-- ROTA 2: PubSub Consumer -> Jackson Unmarshal -> Groovy Script -> BigQuery Writer -->
+        <route id="consumeAndInsertBigQueryRoute">
+            <from uri="google-pubsub:sample-integration-env:currency-rates-sub?concurrentConsumers=1"/>
+            <onException>
+                <exception>com.fasterxml.jackson.core.JsonParseException</exception>
+                <handled><constant>true</constant></handled>
+                <log loggingLevel="WARN" message="PubSub'daki eski/bozuk mesaj atlandi."/>
+            </onException>
+            <log message="PubSub'dan mesaj alindi, JSON'a cevriliyor..."/>
+             <log message="PubSub veri alindi: ${body}"/>
+    <!-- 1. PubSub'dan Gelen Bayt/Stream İçeriği UTF-8 String'e Zorluyoruz -->
+            <!--<convertBodyTo type="java.lang.String"/> -->
+
+            <!-- 2. Jackson ile JSON'ı Java Map Nesnesine Çeviriyoruz -->
+            <unmarshal>
+                <json library="Jackson"/>
+            </unmarshal>
+
+            <log message="JSON Map yapisina donusturuldu. Groovy hesaplamasi basliyor..."/>
+                           <log message="PubSub veri alindi: ${body}"/>
+
+            <!-- 2. ADIM: Groovy Script ile Hesaplama -->
+            <script>
+                <groovy><![CDATA[
+                    import java.math.RoundingMode
+
+                    // Body kesinlikle Map nesnesidir
+                    def json = exchange.message.body
+                    
+                    def processedDate = json.processed_date
+                    def rates = json.data.rates
+                    def base = (json.data.base != null) ? json.data.base : "EUR"
+
+                    Map currentRates = [:]
+                    currentRates[base] = 1.0G
+                    rates.each { k, v -> currentRates[k] = new BigDecimal(v.toString()) }
+
+                    BigDecimal tryRate = currentRates['TRY']
+
+                    def camelContext = exchange.getContext()
+                    Map previousRates = camelContext.getRegistry().lookupByNameAndType("PREVIOUS_RATES_STORE", Map.class)
+                    if (previousRates == null) {
+                        previousRates = new java.util.concurrent.ConcurrentHashMap()
+                        camelContext.getRegistry().bind("PREVIOUS_RATES_STORE", previousRates)
+                    }
+
+                    def results = []
+
+                    currentRates.each { symbol, rate ->
+                        BigDecimal prevRate = previousRates[symbol]
+                        BigDecimal nominalDiff = 0.0G
+                        BigDecimal percentageDiff = 0.0G
+
+                        if (prevRate != null && prevRate != 0) {
+                            nominalDiff = rate - prevRate
+                            percentageDiff = (nominalDiff / prevRate).setScale(6, RoundingMode.HALF_UP) * 100G
+                        }
+
+                        BigDecimal tryEquivalent = 0.0G
+                        if (tryRate != null && rate != 0) {
+                            tryEquivalent = (tryRate / rate).setScale(4, RoundingMode.HALF_UP)
+                        }
+
+                        BigDecimal displayPrevRate = (prevRate != null) ? prevRate : rate
+
+                        results.add([
+                            "processed_date": processedDate,
+                            "symbol": symbol,
+                            "rate": rate.setScale(6, RoundingMode.HALF_UP),
+                            "previous_rate": displayPrevRate.setScale(6, RoundingMode.HALF_UP),
+                            "nominal_diff": nominalDiff.setScale(6, RoundingMode.HALF_UP),
+                            "percentage_diff": percentageDiff.setScale(4, RoundingMode.HALF_UP),
+                            "try_equivalent": tryEquivalent
+                        ])
+
+                        previousRates[symbol] = rate
+                    }
+
+                    // Mesaj gövdesini BigQuery'nin kabul ettiği List<Map> nesnesine eşitliyoruz
+                    exchange.message.body = results
+                ]]></groovy>
+            </script>
+
+            <log message="Hesaplama bitti. Yeni Body Tipi: ${body.class.name}"/>
+
+            <!-- 3. ADIM: BigQuery'ye Yazma -->
+            <to uri="google-bigquery:sample-integration-env:currencyrates:rates"/>
+
+            <log message="BigQuery tablosuna basariyla yazildi."/>
+        </route>
+
+    </camelContext>
+</beans>
