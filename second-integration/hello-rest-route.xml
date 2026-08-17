@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<camel xmlns="http://camel.apache.org/schema/spring">
+
+    <!-- REST Endpoint Tanımı -->
+    <rest path="/hello">
+        <get path="/hi">
+            <to uri="direct:hesapla"/>
+        </get>
+    </rest>
+
+    <!-- İş Mantığı Rotalaması -->
+    <route id="helloHesaplaRoute">
+        <from uri="direct:hesapla"/>
+
+        <!-- Groovy Scripting -->
+        <setBody>
+            <groovy><![CDATA[
+                def isim = request.headers.get("isim")
+                def dogumTarihiStr = request.headers.get("dogumTarihi")
+
+                if (!isim || !dogumTarihiStr) {
+                    return [
+                        status: "ERROR",
+                        message: "Lutfen 'isim' ve 'dogumTarihi' (YYYY-MM-DD) parametrelerini girin."
+                    ]
+                }
+
+                def dogumTarihi = java.time.LocalDate.parse(dogumTarihiStr)
+                def yas = java.time.Period.between(dogumTarihi, java.time.LocalDate.now()).years
+
+                return [
+                    isim: isim,
+                    yas: yas,
+                    mesaj: "Merhaba " + isim + ", " + yas + " yasindasiniz."
+                ]
+            ]]></groovy>
+        </setBody>
+
+        <!-- Otomatik JSON Dönüşümü -->
+        <marshal>
+            <json/>
+        </marshal>
+    </route>
+
+</camel>
