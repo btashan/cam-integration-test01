@@ -5,7 +5,7 @@
         <setBody>
             <groovy>
                 def bugun = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern('dd-MM-yyyy'))
-                bugun + " Merhaba Dunya"
+                bugun + " Merhaba Dunya" + "Yine merhaba"
             </groovy>
         </setBody>
         <log message="${body}"/>
