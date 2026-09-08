@@ -1,5 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<camel xmlns="http://camel.apache.org/schema/spring">
+<?xml version="1.0" encoding="UTF-8"?><camel xmlns="http://camel.apache.org/schema/spring">
 
     <!-- REST Endpoint Tanımı -->
     <rest path="/hello">
@@ -14,7 +13,7 @@
 
         <!-- Groovy Scripting -->
         <setBody>
-            <groovy><![CDATA[
+            <javascript>
                 def isim = request.headers.get("isim")
                 def dogumTarihiStr = request.headers.get("dogumTarihi")
 
@@ -33,7 +32,7 @@
                     yas: yas,
                     mesaj: "Merhaba " + isim + ", " + yas + " yasindasiniz."
                 ]
-            ]]></groovy>
+            </javascript>
         </setBody>
 
         <!-- Otomatik JSON Dönüşümü -->
