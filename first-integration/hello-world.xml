@@ -1,0 +1,5 @@
+<routes xmlns="http://camel.apache.org/schema/spring">
+    <route id="new-route">
+        <from uri="direct:start"/>
+    </route>
+</routes>
