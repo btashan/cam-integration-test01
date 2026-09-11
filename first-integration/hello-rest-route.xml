@@ -9,7 +9,7 @@
 
     <!-- İş Mantığı Rotalaması -->
     <route id="helloHesaplaRoute">
-        <from uri="direct:hesapla"/>
+        <from uri="direct:hesapla"/><from uri="cron:"/>
 
         <!-- Groovy Scripting -->
         <setBody>
@@ -21,12 +21,12 @@
                     return [
                         status: "ERROR",
                         message: "Lutfen 'isim' ve 'dogumTarihi' (YYYY-MM-DD) parametrelerini girin."
-                    ]
+                    ] 
                 }
 
                 def dogumTarihi = java.time.LocalDate.parse(dogumTarihiStr)
                 def yas = java.time.Period.between(dogumTarihi, java.time.LocalDate.now()).years
-
+                
                 return [
                     isim: isim,
                     yas: yas,
@@ -38,7 +38,7 @@
         <!-- Otomatik JSON Dönüşümü -->
         <marshal>
             <json/>
-        </marshal>
+        </marshal><from uri="cron:"/>
     </route>
 
 </camel>
