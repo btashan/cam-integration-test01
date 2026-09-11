@@ -8,7 +8,7 @@ public class MyTransformerBean {
      */
     public String processPayload(String body) {
         if (body == null || body.trim().isEmpty()) {
-            body = "Boş Veri";
+            body = "Boş Veri"; 
         }
         // Gelen veriyi işleyip XML formatında süsleyerek geri döner
         return "<processed-data>\n" +
