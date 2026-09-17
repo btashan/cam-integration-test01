@@ -6,7 +6,8 @@
                 def bugun = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern('dd-MM-yyyy'))
                 bugun + " Merhaba Dunya" + "Yine merhaba"
             </groovy>
-        </setBody>
+        </setBody> 
+        
         <log message="${body}"/><to uri="log:"/><from uri="timer:"/><from uri="timer:"/>
     </route>
 </routes>
