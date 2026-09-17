@@ -1,0 +1,267 @@
+<routes>
+
+    <!-- Butun route'larda ortak onException: hatayi yakalar, errorRouteId /
+         errorMessage exchange property'lerini set eder, handle-integration-error'a
+         yonlendirir. CustomerSyncRoute.java'nin (Java DSL) XML DSL karsiligi.
+         Not: bu XML parser'i (camel-xml-io-dsl) context-genelinde onException
+         desteklemiyor (ayri bir root dokuman gerektiriyor), bu yuzden ayni
+         blogu her route'un basina tekrarliyoruz. -->
+
+    <!-- ANA ROUTE: her tick'te checkpoint'i (platform-state) okur, PrestaShop'tan
+         guncellenen customer'lari ceker, her birini Odoo'ya yazar, sonra yeni
+         checkpoint'i yazar. Tum kritik bolge (checkpoint oku -> isle -> checkpoint
+         yaz) platform-lock ile korunur: bir onceki tick hala suruyorsa (ornegin
+         PrestaShop/Odoo yavas yanit veriyorsa) bir sonraki timer tetiklemesi
+         uzerine binmez, sadece o tick'i atlar. -->
+    <route id="customer-sync-poll-route">
+        <from id="csp-from-timer" uri="timer:customerSyncTimer?period={{vars.SYNC_PERIOD_MS}}"/><to uri="platform-state:?operation=get"/>
+
+        <!-- Kilit baskasinda (onceki tick hala suruyor): bu bir hata degil, beklenen ve
+             kurtarilabilir bir durum - CAMELYNE_INCIDENT olarak loglama, sessizce atla.
+             Backoff zaten timer'in kendi period'u - bir sonraki tick yeniden dener. -->
+        <onException id="csp-on-lock-busy">
+            <exception>com.camelyne.platform.shared.LockContentionException</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <log id="csp-log-lock-busy" message="[customer-sync] Onceki calisma hala suruyor, bu tick atlandi."/>
+        </onException>
+
+        <!-- Genel hata (lock acquire de dahil - ornegin control-plane'in Integration State
+             Store'una erisilemiyorsa) - bunlar gercek incident'lar. -->
+        <onException id="csp-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="csp-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="csp-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="csp-onerr-to-handler" uri="direct:handle-integration-error"/>
+        </onException>
+
+        <log id="bp-sync-start" message="[customer-sync] Senkronizasyon basladi."/>
+
+        <!-- Kritik bolgeye girmeden once kilidi al. holderId = bu tick'in exchangeId'si
+             (her tick'te benzersiz); leaseId'yi asagida bir exchange property'de
+             sakliyoruz cunku removeHeaders("*") cagrilari header'i silecek. -->
+        <setHeader id="csp-set-lock-holder" name="CamelyneLockHolderId">
+            <simple>${exchangeId}</simple>
+        </setHeader>
+        <to id="csp-lock-acquire" uri="platform-lock:customer-sync?operation=acquire"/>
+        <setProperty id="csp-set-lock-lease" name="lockLeaseId">
+            <simple>${header.CamelyneLockLeaseId}</simple>
+        </setProperty>
+
+        <doTry id="csp-try">
+            <to id="csp-to-read-checkpoint" uri="direct:read-checkpoint"/>
+            <setProperty id="csp-set-since-date" name="sinceDateUpd">
+                <simple>${body}</simple>
+            </setProperty>
+            <setProperty id="csp-set-until-date" name="untilDateUpd">
+                <simple>${date:now:yyyy-MM-dd HH:mm:ss}</simple>
+            </setProperty>
+            <log id="csp-log-range" message="[customer-sync] Aralik: ${exchangeProperty.sinceDateUpd} -&gt; ${exchangeProperty.untilDateUpd}"/>
+
+            <!-- PrestaShop: bu aralikta guncellenen customer'lari cek -->
+            <removeHeaders id="csp-remove-headers-presta" pattern="*"/>
+            <setHeader id="csp-set-method-get" name="CamelHttpMethod">
+                <constant>GET</constant>
+            </setHeader>
+            <!-- allowOptimisedComponents="false" SART: toD'nin varsayilan davranisi
+                 (camel-http'nin HttpSendDynamicAware optimizasyonu) dinamik URI'yi
+                 sabit endpoint + "ham" query header'ina bolup PrestaShop'a gonderiyor;
+                 bu optimize yol query string'i (ozellikle display=[...]) bozuyor ve
+                 PrestaShop "The 'display' syntax is wrong" (error 36) donduruyor.
+                 allowOptimisedComponents="false" ile toD generic/normal endpoint
+                 cozumlemesini kullanir (dogrulandi: PrestaShop demo ortamina karsi
+                 standalone testte optimizasyon acikken 500, kapaliyken 200 + gercek
+                 customer verisi donuyor - tarih formatindaki bosluktan BAGIMSIZ). -->
+            <toD id="csp-http-get-presta-customers" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/customers?filter%5Bdate_upd%5D=%5B${exchangeProperty.sinceDateUpd}%2C${exchangeProperty.untilDateUpd}%5D&amp;date=1&amp;sort=%5Bdate_upd_ASC%5D&amp;display=%5Bid%2Cfirstname%2Clastname%2Cemail%2Cdate_upd%5D&amp;authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+            <convertBodyTo id="csp-convert-presta-response" type="java.lang.String"/>
+            <log id="bp-presta-response" message="[customer-sync] PrestaShop yaniti: ${body}"/>
+
+            <split id="csp-split-customers">
+                <xpath>/prestashop/customers/customer</xpath>
+                <log id="csp-split-log-node" message="[customer-sync] Islenen customer node: ${body}"/>
+                <script id="csp-split-transform">
+                    <groovy>resource:file:transform-customer.groovy</groovy>
+                </script>
+                <to id="csp-split-to-sync-customer" uri="direct:sync-one-customer"/>
+            </split>
+
+            <setBody id="csp-set-body-checkpoint-date">
+                <simple>${exchangeProperty.untilDateUpd}</simple>
+            </setBody>
+            <to id="csp-to-write-checkpoint" uri="direct:write-checkpoint"/>
+
+            <doCatch id="csp-catch">
+                <exception>java.lang.Exception</exception>
+                <setProperty id="csp-catch-set-route-id" name="errorRouteId">
+                    <simple>${routeId}</simple>
+                </setProperty>
+                <setProperty id="csp-catch-set-message" name="errorMessage">
+                    <simple>${exception.message}</simple>
+                </setProperty>
+                <to id="csp-catch-to-handler" uri="direct:handle-integration-error"/>
+            </doCatch>
+            <doFinally id="csp-finally">
+                <!-- Basarili da olsa, catch'e dusse de kilit HER ZAMAN serbest birakilir. -->
+                <setHeader id="csp-set-lock-lease-release" name="CamelyneLockLeaseId">
+                    <simple>${exchangeProperty.lockLeaseId}</simple>
+                </setHeader>
+                <to id="csp-lock-release" uri="platform-lock:customer-sync?operation=release"/>
+            </doFinally>
+        </doTry>
+
+        <log id="csp-log-done" message="[customer-sync] Senkronizasyon bitti. Yeni checkpoint: ${exchangeProperty.untilDateUpd}"/>
+    </route>
+
+    <!-- Tek bir PrestaShop customer'ini Odoo'da bul/olustur/guncelle.
+         Gelen body: [id, firstname, lastname, email, dateUpd] Map'i.
+         Not: common.login yerine dogrudan execute_kw + API key kullaniliyor
+         (uid={{vars.ODOO_UID}}, sifre yerine {{secrets.ODOO_API_KEY}}) - Bruno'da
+         dogrulanan calisma sekli. -->
+    <route id="sync-one-customer-route">
+        <from id="soc-from-direct" uri="direct:sync-one-customer"/>
+        <onException id="soc-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="soc-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="soc-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="soc-onerr-to-handler" uri="direct:handle-integration-error"/>
+        </onException>
+
+        <setProperty id="soc-set-email" name="custEmail">
+            <simple>${body[email]}</simple>
+        </setProperty>
+        <setProperty id="soc-set-name" name="custName">
+            <simple>${body[firstname]} ${body[lastname]}</simple>
+        </setProperty>
+
+        <!-- Odoo'da bu email ile partner var mi? -->
+        <removeHeaders id="soc-remove-headers-search" pattern="*"/>
+        <setHeader id="soc-set-method-search" name="CamelHttpMethod">
+            <constant>POST</constant>
+        </setHeader>
+        <setHeader id="soc-set-content-type-search" name="Content-Type">
+            <constant>application/json</constant>
+        </setHeader>
+        <setBody id="soc-set-body-search">
+            <simple>{"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":["{{vars.ODOO_DB}}",{{vars.ODOO_UID}},"{{secrets.ODOO_API_KEY}}","res.partner","search_read",[[["email","=","${exchangeProperty.custEmail}"]]],{"fields":["id"],"limit":1}]},"id":2}</simple>
+        </setBody>
+        <to id="soc-call-odoo-search" uri="{{vars.ODOO_BASE_URL}}/jsonrpc?bridgeEndpoint=true&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+        <convertBodyTo id="soc-convert-search-response" type="java.lang.String"/>
+        <unmarshal id="soc-unmarshal-search-response">
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty id="soc-set-existing-partners" name="existingPartners">
+            <simple>${body[result]}</simple>
+        </setProperty>
+
+        <choice id="soc-choice-exists">
+            <when id="soc-when-exists">
+                <simple>${exchangeProperty.existingPartners.size()} &gt; 0</simple>
+                <setProperty id="soc-set-partner-id" name="partnerId">
+                    <simple>${exchangeProperty.existingPartners[0][id]}</simple>
+                </setProperty>
+                <removeHeaders id="soc-remove-headers-write" pattern="*"/>
+                <setHeader id="soc-set-method-write" name="CamelHttpMethod">
+                    <constant>POST</constant>
+                </setHeader>
+                <setHeader id="soc-set-content-type-write" name="Content-Type">
+                    <constant>application/json</constant>
+                </setHeader>
+                <setBody id="soc-set-body-write">
+                    <simple>{"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":["{{vars.ODOO_DB}}",{{vars.ODOO_UID}},"{{secrets.ODOO_API_KEY}}","res.partner","write",[[${exchangeProperty.partnerId}],{"name":"${exchangeProperty.custName}","email":"${exchangeProperty.custEmail}"}]]},"id":3}</simple>
+                </setBody>
+                <to id="soc-call-odoo-write" uri="{{vars.ODOO_BASE_URL}}/jsonrpc?bridgeEndpoint=true&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <log id="soc-log-updated" message="[customer-sync] Odoo partner guncellendi: id=${exchangeProperty.partnerId} email=${exchangeProperty.custEmail}"/>
+            </when>
+            <otherwise id="soc-otherwise-create">
+                <removeHeaders id="soc-remove-headers-create" pattern="*"/>
+                <setHeader id="soc-set-method-create" name="CamelHttpMethod">
+                    <constant>POST</constant>
+                </setHeader>
+                <setHeader id="soc-set-content-type-create" name="Content-Type">
+                    <constant>application/json</constant>
+                </setHeader>
+                <setBody id="soc-set-body-create">
+                    <simple>{"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":["{{vars.ODOO_DB}}",{{vars.ODOO_UID}},"{{secrets.ODOO_API_KEY}}","res.partner","create",[{"name":"${exchangeProperty.custName}","email":"${exchangeProperty.custEmail}","customer_rank":1}]]},"id":4}</simple>
+                </setBody>
+                <to id="soc-call-odoo-create" uri="{{vars.ODOO_BASE_URL}}/jsonrpc?bridgeEndpoint=true&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <log id="soc-log-created" message="[customer-sync] Odoo partner olusturuldu: email=${exchangeProperty.custEmail}"/>
+            </otherwise>
+        </choice>
+    </route>
+
+    <!-- Checkpoint okuma: platform-state'ten son islenen date_upd degerini okur
+         (control-plane'in Integration State Store'u - bkz. InternalIntegrationStateController). -->
+    <route id="read-checkpoint-route">
+        <from id="rc-from-direct" uri="direct:read-checkpoint"/>
+        <onException id="rc-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="rc-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="rc-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="rc-onerr-to-handler" uri="direct:handle-integration-error"/>
+        </onException>
+        <to id="rc-platform-state-get" uri="platform-state:customer-sync.since-date-upd?operation=get"/>
+        <choice id="rc-choice-first-run">
+            <when id="rc-when-no-checkpoint">
+                <!-- Ilk calistirma: checkpoint henuz yazilmamis (platform-state 404 donup
+                     CamelyneStateFound=false header'ini set eder), gecmise donuk varsayilan
+                     tarih kullan. Bulunduysa body zaten duz string degeri tasiyor, ek bir
+                     donusum gerekmiyor. -->
+                <simple>${header.CamelyneStateFound} == false</simple>
+                <setBody id="rc-set-initial-date">
+                    <simple>{{vars.SYNC_INITIAL_SINCE_DATE}}</simple>
+                </setBody>
+            </when>
+        </choice>
+    </route>
+
+    <!-- Checkpoint yazma: gelen body (yeni tarih, duz string) platform-state'e yazilir. -->
+    <route id="write-checkpoint-route">
+        <from id="wc-from-direct" uri="direct:write-checkpoint"/>
+        <onException id="wc-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="wc-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="wc-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="wc-onerr-to-handler" uri="direct:handle-integration-error"/>
+        </onException>
+        <to id="wc-platform-state-put" uri="platform-state:customer-sync.since-date-upd?operation=put"/>
+    </route>
+
+    <!-- Entegrasyon hatalarini tek noktadan, yapilandirilmis (greppable)
+         formatta loglar. "CAMELYNE_INCIDENT" prefix'i sayesinde harici bir
+         log toplayici/alerting sistemi bu satirlari yakalayip otomatik
+         ticket acabilir. -->
+    <route id="handle-integration-error-route">
+        <from id="hie-from-direct" uri="direct:handle-integration-error"/>
+        <log id="hie-log-incident" loggingLevel="ERROR" message="CAMELYNE_INCIDENT integration=customer-sync route=${exchangeProperty.errorRouteId} exchangeId=${exchangeId} error=${exchangeProperty.errorMessage}"/>
+    </route>
+
+</routes>
