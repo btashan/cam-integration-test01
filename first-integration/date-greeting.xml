@@ -8,6 +8,6 @@
             </groovy>
         </setBody> 
         
-        <log message="${body}"/><to uri="log:"/>
+        <log message="${body}"/>
     </route>
 </routes>
