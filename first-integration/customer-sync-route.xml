@@ -14,7 +14,7 @@
          PrestaShop/Odoo yavas yanit veriyorsa) bir sonraki timer tetiklemesi
          uzerine binmez, sadece o tick'i atlar. -->
     <route id="customer-sync-poll-route">
-        <from id="csp-from-timer" uri="timer:customerSyncTimer?period={{vars.SYNC_PERIOD_MS}}"/><to uri="platform-state:?operation=get"/>
+        <from id="csp-from-timer" uri="timer:customerSyncTimer?period={{vars.SYNC_PERIOD_MS}}"/>
 
         <!-- Kilit baskasinda (onceki tick hala suruyor): bu bir hata degil, beklenen ve
              kurtarilabilir bir durum - CAMELYNE_INCIDENT olarak loglama, sessizce atla.
