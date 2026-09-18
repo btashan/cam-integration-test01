@@ -9,7 +9,7 @@
 
     <!-- İş Mantığı Rotalaması -->
     <route id="helloHesaplaRoute">
-        <from uri="direct:hesapla"/><from uri="cron:"/>
+        <from uri="direct:hesapla"/>
 
         <!-- Groovy Scripting -->
         <setBody>
@@ -38,7 +38,7 @@
         <!-- Otomatik JSON Dönüşümü -->
         <marshal>
             <json/>
-        </marshal><from uri="cron:"/>
+        </marshal>
     </route>
 
 </camel>
