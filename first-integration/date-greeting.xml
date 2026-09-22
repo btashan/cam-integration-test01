@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><routes xmlns="http://camel.apache.org/schema/spring">
+<!-- DEPS org.apache.camel:camel-elasticsearch:4.8.0 -->
+<!-- DEPS org.apache.camel:camel-mustache:4.8.0 -->
     <route id="groovy-date-greeting">
         <from uri="timer:dateGreetingTimer?repeatCount=1"/>
         <setBody>
@@ -7,7 +9,8 @@
                 bugun + " Merhaba Dunya" + "Yine merhaba"
             </groovy>
         </setBody> 
-        
+        <setHeader name="test"><constant>test</constant> 
+        </setHeader>
         <log message="${body}"/>
     </route>
 </routes>
