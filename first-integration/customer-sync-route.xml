@@ -83,8 +83,18 @@
             <toD id="csp-http-get-presta-customers" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/customers?filter%5Bdate_upd%5D=%5B${exchangeProperty.sinceDateUpd}%2C${exchangeProperty.untilDateUpd}%5D&amp;date=1&amp;sort=%5Bdate_upd_ASC%5D&amp;display=%5Bid%2Cfirstname%2Clastname%2Cemail%2Cdate_upd%5D&amp;authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
             <convertBodyTo id="csp-convert-presta-response" type="java.lang.String"/>
             <log id="bp-presta-response" message="[customer-sync] PrestaShop yaniti: ${body}"/>
+            <!-- throwExceptionOnFailure=false oldugu icin 4xx/5xx sessizce gecer: hata
+                 govdesinde customer node'u olmadigindan split bos doner ve checkpoint
+                 ilerleyip bu araligi kaybederdi. Bu yuzden hata kodunu elle firlat. -->
+            <filter id="csp-filter-presta-failed">
+                <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+                <throwException id="csp-throw-presta-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+            </filter>
 
-            <split id="csp-split-customers">
+            <!-- stopOnException: bir customer basarisiz olursa kalanlari isleme, hatayi
+                 doCatch'e tasi - checkpoint ILERLEMEZ, bir sonraki tick ayni araligi
+                 yeniden dener (Odoo tarafi email ile upsert, tekrar islemek guvenli). -->
+            <split id="csp-split-customers" stopOnException="true">
                 <xpath>/prestashop/customers/customer</xpath>
                 <log id="csp-split-log-node" message="[customer-sync] Islenen customer node: ${body}"/>
                 <script id="csp-split-transform">
@@ -97,6 +107,7 @@
                 <simple>${exchangeProperty.untilDateUpd}</simple>
             </setBody>
             <to id="csp-to-write-checkpoint" uri="direct:write-checkpoint"/>
+            <log id="csp-log-done" message="[customer-sync] Senkronizasyon bitti. Yeni checkpoint: ${exchangeProperty.untilDateUpd}"/>
 
             <doCatch id="csp-catch">
                 <exception>java.lang.Exception</exception>
@@ -107,6 +118,7 @@
                     <simple>${exception.message}</simple>
                 </setProperty>
                 <to id="csp-catch-to-handler" uri="direct:handle-integration-error"/>
+                <log id="csp-log-failed" loggingLevel="WARN" message="[customer-sync] Senkronizasyon basarisiz, checkpoint ilerletilmedi (${exchangeProperty.sinceDateUpd} korunuyor)."/>
             </doCatch>
             <doFinally id="csp-finally">
                 <!-- Basarili da olsa, catch'e dusse de kilit HER ZAMAN serbest birakilir. -->
@@ -116,8 +128,6 @@
                 <to id="csp-lock-release" uri="platform-lock:customer-sync?operation=release"/>
             </doFinally>
         </doTry>
-
-        <log id="csp-log-done" message="[customer-sync] Senkronizasyon bitti. Yeni checkpoint: ${exchangeProperty.untilDateUpd}"/>
     </route>
 
     <!-- Tek bir PrestaShop customer'ini Odoo'da bul/olustur/guncelle.
@@ -127,19 +137,9 @@
          dogrulanan calisma sekli. -->
     <route id="sync-one-customer-route">
         <from id="soc-from-direct" uri="direct:sync-one-customer"/>
-        <onException id="soc-on-exception">
-            <exception>java.lang.Exception</exception>
-            <handled>
-                <constant>true</constant>
-            </handled>
-            <setProperty id="soc-onerr-set-route-id" name="errorRouteId">
-                <simple>${routeId}</simple>
-            </setProperty>
-            <setProperty id="soc-onerr-set-message" name="errorMessage">
-                <simple>${exception.message}</simple>
-            </setProperty>
-            <to id="soc-onerr-to-handler" uri="direct:handle-integration-error"/>
-        </onException>
+        <!-- Bilerek onException YOK: hata cagirana (poll route'un doTry'i) yukselir, split durur
+             ve checkpoint ilerlemez. Burada handled=true yapmak basarisiz customer'i sessizce yutup
+             araligi kaybettiriyordu. Incident'i doCatch loglar. -->
 
         <setProperty id="soc-set-email" name="custEmail">
             <simple>${body[email]}</simple>
@@ -164,6 +164,11 @@
         <unmarshal id="soc-unmarshal-search-response">
             <json library="Jackson"/>
         </unmarshal>
+        <!-- Odoo JSON-RPC hatalari HTTP 200 + "error" alani ile doner, HTTP bileseni yakalamaz. -->
+        <filter id="soc-filter-search-error">
+            <simple>${body[error]} != null</simple>
+            <throwException id="soc-throw-search-error" exceptionType="java.lang.IllegalStateException" message="Odoo search_read basarisiz (email=${exchangeProperty.custEmail}): ${body[error]}"/>
+        </filter>
         <setProperty id="soc-set-existing-partners" name="existingPartners">
             <simple>${body[result]}</simple>
         </setProperty>
@@ -185,6 +190,14 @@
                     <simple>{"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":["{{vars.ODOO_DB}}",{{vars.ODOO_UID}},"{{secrets.ODOO_API_KEY}}","res.partner","write",[[${exchangeProperty.partnerId}],{"name":"${exchangeProperty.custName}","email":"${exchangeProperty.custEmail}"}]]},"id":3}</simple>
                 </setBody>
                 <to id="soc-call-odoo-write" uri="{{vars.ODOO_BASE_URL}}/jsonrpc?bridgeEndpoint=true&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <convertBodyTo id="soc-convert-write-response" type="java.lang.String"/>
+                <unmarshal id="soc-unmarshal-write-response">
+                    <json library="Jackson"/>
+                </unmarshal>
+                <filter id="soc-filter-write-error">
+                    <simple>${body[error]} != null</simple>
+                    <throwException id="soc-throw-write-error" exceptionType="java.lang.IllegalStateException" message="Odoo write basarisiz (email=${exchangeProperty.custEmail}): ${body[error]}"/>
+                </filter>
                 <log id="soc-log-updated" message="[customer-sync] Odoo partner guncellendi: id=${exchangeProperty.partnerId} email=${exchangeProperty.custEmail}"/>
             </when>
             <otherwise id="soc-otherwise-create">
@@ -199,6 +212,14 @@
                     <simple>{"jsonrpc":"2.0","method":"call","params":{"service":"object","method":"execute_kw","args":["{{vars.ODOO_DB}}",{{vars.ODOO_UID}},"{{secrets.ODOO_API_KEY}}","res.partner","create",[{"name":"${exchangeProperty.custName}","email":"${exchangeProperty.custEmail}","customer_rank":1}]]},"id":4}</simple>
                 </setBody>
                 <to id="soc-call-odoo-create" uri="{{vars.ODOO_BASE_URL}}/jsonrpc?bridgeEndpoint=true&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <convertBodyTo id="soc-convert-create-response" type="java.lang.String"/>
+                <unmarshal id="soc-unmarshal-create-response">
+                    <json library="Jackson"/>
+                </unmarshal>
+                <filter id="soc-filter-create-error">
+                    <simple>${body[error]} != null</simple>
+                    <throwException id="soc-throw-create-error" exceptionType="java.lang.IllegalStateException" message="Odoo create basarisiz (email=${exchangeProperty.custEmail}): ${body[error]}"/>
+                </filter>
                 <log id="soc-log-created" message="[customer-sync] Odoo partner olusturuldu: email=${exchangeProperty.custEmail}"/>
             </otherwise>
         </choice>
@@ -208,19 +229,8 @@
          (control-plane'in Integration State Store'u - bkz. InternalIntegrationStateController). -->
     <route id="read-checkpoint-route">
         <from id="rc-from-direct" uri="direct:read-checkpoint"/>
-        <onException id="rc-on-exception">
-            <exception>java.lang.Exception</exception>
-            <handled>
-                <constant>true</constant>
-            </handled>
-            <setProperty id="rc-onerr-set-route-id" name="errorRouteId">
-                <simple>${routeId}</simple>
-            </setProperty>
-            <setProperty id="rc-onerr-set-message" name="errorMessage">
-                <simple>${exception.message}</simple>
-            </setProperty>
-            <to id="rc-onerr-to-handler" uri="direct:handle-integration-error"/>
-        </onException>
+        <!-- Bilerek onException YOK: okuma basarisizsa poll route'un doCatch'ine yukselsin;
+             handled=true ile devam etmek bozuk bir body'yi since-date olarak kullaniyordu. -->
         <to id="rc-platform-state-get" uri="platform-state:customer-sync.since-date-upd?operation=get"/>
         <choice id="rc-choice-first-run">
             <when id="rc-when-no-checkpoint">
@@ -239,19 +249,8 @@
     <!-- Checkpoint yazma: gelen body (yeni tarih, duz string) platform-state'e yazilir. -->
     <route id="write-checkpoint-route">
         <from id="wc-from-direct" uri="direct:write-checkpoint"/>
-        <onException id="wc-on-exception">
-            <exception>java.lang.Exception</exception>
-            <handled>
-                <constant>true</constant>
-            </handled>
-            <setProperty id="wc-onerr-set-route-id" name="errorRouteId">
-                <simple>${routeId}</simple>
-            </setProperty>
-            <setProperty id="wc-onerr-set-message" name="errorMessage">
-                <simple>${exception.message}</simple>
-            </setProperty>
-            <to id="wc-onerr-to-handler" uri="direct:handle-integration-error"/>
-        </onException>
+        <!-- Bilerek onException YOK: yazma basarisizsa poll route'un doCatch'i raporlasin
+             (yanlislikla "bitti" loglanmasin). -->
         <to id="wc-platform-state-put" uri="platform-state:customer-sync.since-date-upd?operation=put"/>
     </route>
 
