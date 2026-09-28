@@ -1,0 +1,535 @@
+<routes>
+
+    <!-- Odoo -> PrestaShop urun senkronizasyonu (XML DSL).
+
+         FAZ 1: Odoo'da write_date'i checkpoint'ten sonra olan product.product
+         kayitlarini sayfa sayfa ({{vars.PRODUCT_SYNC_PAGE_SIZE}} kayit) ceker ve
+         hepsini ortak bir staging JSON dosyasina
+         ({{vars.PRODUCT_SYNC_STAGING_DIR}}/{{vars.PRODUCT_SYNC_STAGING_FILE_NAME}})
+         id bazinda upsert eder.
+         FAZ 2: staging dosyasindaki her urunu PrestaShop'a yazar (create/PATCH +
+         stok + gorsel). Basarili olanlar staging'den silinir, basarisizlar kalir
+         ve bir sonraki tick'te yeniden denenir. Iki faz ayni tick'te ve ayni
+         platform-lock altinda calisir; boylece staging dosyasina ayni anda iki
+         yazan olmaz.
+
+         Eslestirme: PrestaShop urununun mpn alani "ODOO-<odoo product id>" tutar
+         (default_code cogu urunde bos oldugu icin reference ile eslestirilemez).
+
+         Sayfalama: ayni saniyede yazilmis cok sayida urun olabildigi icin (toplu
+         import vb.) sadece write_date ile sayfalamak kayit atlatir/tekrarlar. Bu
+         yuzden (write_date, id) ikilisi uzerinden keyset sayfalama yapiliyor:
+             write_date > W  OR  (write_date = W AND id > I)
+         Odoo'da create_date <= write_date oldugu icin ayrica create_date
+         filtresine gerek yok - yeni olusturulan urunler de bu filtreye takilir.
+
+         Kullanilan degiskenler:
+           vars.PRODUCT_SYNC_PERIOD_MS, vars.PRODUCT_SYNC_PAGE_SIZE,
+           vars.PRODUCT_SYNC_INITIAL_SINCE_DATE, vars.PRODUCT_SYNC_STAGING_DIR,
+           vars.PRODUCT_SYNC_STAGING_FILE_NAME, vars.ODOO_BASE_URL, vars.ODOO_DB,
+           vars.HTTP_CONNECT_TIMEOUT_MS, vars.HTTP_SOCKET_TIMEOUT_MS,
+           vars.PRESTA_BASE_URL, vars.PRESTA_LANGUAGE_IDS (virgullu, ornegin "1,2"),
+           vars.PRESTA_DEFAULT_CATEGORY_ID, vars.PRESTA_TAX_RULES_GROUP_ID,
+           secrets.ODOO_API_KEY (JSON-2 API icin Bearer token),
+           secrets.PRESTA_API_KEY (webservice key) -->
+
+    <!-- ANA ROUTE: checkpoint'i (platform-state) okur, Odoo'dan degisen urunleri
+         sayfa sayfa ceker, staging dosyasina ekler, checkpoint'i son islenen
+         (write_date, id)'ye ilerletir (FAZ 1); ardindan staging'i PrestaShop'a
+         aktarir (FAZ 2). Kritik bolge platform-lock ile korunur. -->
+    <route id="product-sync-poll-route">
+        <from id="psp-from-timer" uri="timer:productSyncTimer?period={{vars.PRODUCT_SYNC_PERIOD_MS}}"/>
+
+        <!-- Kilit baskasinda (onceki tick hala suruyor): beklenen durum, sessizce atla. -->
+        <onException id="psp-on-lock-busy">
+            <exception>com.camelyne.platform.shared.LockContentionException</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <log id="psp-log-lock-busy" message="[product-sync] Onceki calisma hala suruyor, bu tick atlandi."/>
+        </onException>
+
+        <onException id="psp-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="psp-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="psp-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="psp-onerr-to-handler" uri="direct:handle-product-sync-error"/>
+        </onException>
+
+        <log id="bp-product-sync-start" message="[product-sync] Senkronizasyon basladi."/>
+
+        <setHeader id="psp-set-lock-holder" name="CamelyneLockHolderId">
+            <simple>${exchangeId}</simple>
+        </setHeader>
+        <to id="psp-lock-acquire" uri="platform-lock:product-sync?operation=acquire"/>
+        <setProperty id="psp-set-lock-lease" name="lockLeaseId">
+            <simple>${header.CamelyneLockLeaseId}</simple>
+        </setProperty>
+
+        <doTry id="psp-try">
+            <!-- Cursor + sayfa akumulatoru -->
+            <to id="psp-to-read-checkpoint" uri="direct:read-product-checkpoint"/>
+            <setProperty id="psp-set-cursor-write-date" name="cursorWriteDate">
+                <simple>${body[last_write_date]}</simple>
+            </setProperty>
+            <setProperty id="psp-set-cursor-id" name="cursorId">
+                <simple>${body[last_id]}</simple>
+            </setProperty>
+            <setProperty id="psp-init-fetched-products" name="fetchedProducts">
+                <groovy>[]</groovy>
+            </setProperty>
+            <setProperty id="psp-init-has-more" name="hasMore">
+                <simple resultType="java.lang.Boolean">true</simple>
+            </setProperty>
+            <log id="psp-log-cursor" message="[product-sync] Baslangic cursor: write_date=${exchangeProperty.cursorWriteDate} id=${exchangeProperty.cursorId}"/>
+
+            <!-- Son sayfa PAGE_SIZE'dan az kayit donene kadar don. Keyset cursor her
+                 dolu sayfada kesin ilerledigi icin sonsuz dongu riski yok. -->
+            <loop id="psp-loop-pages" doWhile="true">
+                <simple>${exchangeProperty.hasMore} == true</simple>
+                <to id="psp-loop-to-fetch-page" uri="direct:fetch-odoo-product-page"/>
+            </loop>
+
+            <log id="bp-odoo-products-fetched" message="[product-sync] Odoo'dan toplam ${exchangeProperty.fetchedProducts.size()} urun alindi."/>
+
+            <choice id="psp-choice-any-fetched">
+                <when id="psp-when-fetched">
+                    <simple>${exchangeProperty.fetchedProducts.size()} &gt; 0</simple>
+                    <!-- Once staging, sonra checkpoint: staging yazilamazsa checkpoint
+                         ilerlemez, bir sonraki tick ayni araligi yeniden ceker (staging
+                         id bazinda upsert, tekrar islemek guvenli). -->
+                    <to id="psp-to-append-staging" uri="direct:append-products-to-staging"/>
+                    <to id="psp-to-write-checkpoint" uri="direct:write-product-checkpoint"/>
+                    <log id="psp-log-done" message="[product-sync] Senkronizasyon bitti. Yeni checkpoint: write_date=${exchangeProperty.cursorWriteDate} id=${exchangeProperty.cursorId}"/>
+                </when>
+                <otherwise id="psp-otherwise-nothing">
+                    <log id="psp-log-nothing" message="[product-sync] Yeni/guncellenen urun yok, checkpoint degismedi."/>
+                </otherwise>
+            </choice>
+
+            <!-- FAZ 2: yeni urun gelmese de calisir - onceki tick'lerde basarisiz
+                 olup staging'de kalan urunler yeniden denenir. Kendi doTry'i var:
+                 buradaki hata FAZ 1'in checkpoint'ini etkilemez (zaten yazildi). -->
+            <doTry id="psp-push-try">
+                <to id="psp-to-push-staging" uri="direct:push-staging-to-presta"/>
+                <doCatch id="psp-push-catch">
+                    <exception>java.lang.Exception</exception>
+                    <setProperty id="psp-push-catch-set-route-id" name="errorRouteId">
+                        <simple>${routeId}</simple>
+                    </setProperty>
+                    <setProperty id="psp-push-catch-set-message" name="errorMessage">
+                        <simple>${exception.message}</simple>
+                    </setProperty>
+                    <to id="psp-push-catch-to-handler" uri="direct:handle-product-sync-error"/>
+                    <log id="psp-log-push-failed" loggingLevel="WARN" message="[product-sync] PrestaShop aktarimi basarisiz, staging dosyasi korunuyor; bir sonraki tick yeniden denenecek."/>
+                </doCatch>
+            </doTry>
+
+            <doCatch id="psp-catch">
+                <exception>java.lang.Exception</exception>
+                <setProperty id="psp-catch-set-route-id" name="errorRouteId">
+                    <simple>${routeId}</simple>
+                </setProperty>
+                <setProperty id="psp-catch-set-message" name="errorMessage">
+                    <simple>${exception.message}</simple>
+                </setProperty>
+                <to id="psp-catch-to-handler" uri="direct:handle-product-sync-error"/>
+                <log id="psp-log-failed" loggingLevel="WARN" message="[product-sync] Senkronizasyon basarisiz, checkpoint ilerletilmedi."/>
+            </doCatch>
+            <doFinally id="psp-finally">
+                <setHeader id="psp-set-lock-lease-release" name="CamelyneLockLeaseId">
+                    <simple>${exchangeProperty.lockLeaseId}</simple>
+                </setHeader>
+                <to id="psp-lock-release" uri="platform-lock:product-sync?operation=release"/>
+            </doFinally>
+        </doTry>
+    </route>
+
+    <!-- Odoo JSON-2 API'den tek sayfa product.product ceker; gelen kayitlari
+         fetchedProducts'a ekler, cursor'i sayfanin son kaydina ilerletir. -->
+    <route id="fetch-odoo-product-page-route">
+        <from id="fop-from-direct" uri="direct:fetch-odoo-product-page"/>
+        <!-- Bilerek onException YOK: hata poll route'un doCatch'ine yukselsin. -->
+
+        <removeHeaders id="fop-remove-headers" pattern="*"/>
+        <setHeader id="fop-set-method" name="CamelHttpMethod">
+            <constant>POST</constant>
+        </setHeader>
+        <setHeader id="fop-set-content-type" name="Content-Type">
+            <constant>application/json</constant>
+        </setHeader>
+        <setHeader id="fop-set-authorization" name="Authorization">
+            <simple>Bearer {{secrets.ODOO_API_KEY}}</simple>
+        </setHeader>
+        <setHeader id="fop-set-database" name="X-Odoo-Database">
+            <simple>{{vars.ODOO_DB}}</simple>
+        </setHeader>
+        <!-- context.active_test=false: arsivlenen (active=false) urunler de gelsin,
+             FAZ 2 bunlari PrestaShop'ta pasife cekebilsin.
+             Sondaki "} }" bosluklu: yan yana "}}" property placeholder kapanisi
+             sanilip route baslatilamiyor ("Missing {{ from the text"). -->
+        <setBody id="fop-set-body-search-read">
+            <simple>{"domain":["|",["write_date",">","${exchangeProperty.cursorWriteDate}"],"&amp;",["write_date","=","${exchangeProperty.cursorWriteDate}"],["id",">",${exchangeProperty.cursorId}]],"fields":["id","name","display_name","lst_price","default_code","code","partner_ref","active","barcode","image_256","write_date","tax_string","qty_available","description","type","list_price","currency_id","is_storable","service_to_purchase"],"limit":{{vars.PRODUCT_SYNC_PAGE_SIZE}},"order":"write_date asc, id asc","context":{"active_test":false} }</simple>
+        </setBody>
+        <to id="fop-call-odoo-search-read" uri="{{vars.ODOO_BASE_URL}}/json/2/product.product/search_read?bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+        <convertBodyTo id="fop-convert-response" type="java.lang.String"/>
+        <!-- throwExceptionOnFailure=false: hata govdesini (Odoo traceback) mesaja koyabilmek icin elle firlat. -->
+        <filter id="fop-filter-failed">
+            <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+            <throwException id="fop-throw-failed" exceptionType="java.lang.IllegalStateException" message="Odoo HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+        </filter>
+        <unmarshal id="fop-unmarshal-response">
+            <json library="Jackson"/>
+        </unmarshal>
+
+        <script id="fop-collect-page">
+            <groovy>exchange.getProperty('fetchedProducts').addAll(body)</groovy>
+        </script>
+        <setProperty id="fop-set-last-page-size" name="lastPageSize">
+            <simple>${body.size()}</simple>
+        </setProperty>
+        <filter id="fop-filter-page-not-empty">
+            <simple>${body.size()} &gt; 0</simple>
+            <setProperty id="fop-set-cursor-write-date" name="cursorWriteDate">
+                <simple>${body[last][write_date]}</simple>
+            </setProperty>
+            <setProperty id="fop-set-cursor-id" name="cursorId">
+                <simple>${body[last][id]}</simple>
+            </setProperty>
+        </filter>
+        <!-- groovy, simple degil: setProperty icinde simple "==" operatorunu degerlendirmiyor,
+             property'ye "10 == 10" string'i yaziliyor ve dongu ilk sayfadan sonra bitiyordu. -->
+        <setProperty id="fop-set-has-more" name="hasMore">
+            <groovy>body.size() == {{vars.PRODUCT_SYNC_PAGE_SIZE}}</groovy>
+        </setProperty>
+        <log id="fop-log-page" message="[product-sync] Sayfa alindi: ${exchangeProperty.lastPageSize} urun, cursor=(${exchangeProperty.cursorWriteDate}, ${exchangeProperty.cursorId})"/>
+    </route>
+
+    <!-- Staging dosyasi: FAZ 2'nin (PrestaShop'a yazma) okuyacagi ortak JSON dizisi.
+         Mevcut dosya okunur, bu tick'te gelen urunler id bazinda upsert edilir
+         (merge-products-staging.groovy), dosya bastan yazilir. -->
+    <route id="append-products-to-staging-route">
+        <from id="aps-from-direct" uri="direct:append-products-to-staging"/>
+        <!-- Bilerek onException YOK: yazma basarisizsa checkpoint ilerlemesin. -->
+
+        <!-- idempotent=false: noop=true tek basina ayni dosyayi ikinci kez okumayi
+             engelleyebiliyor (in-memory idempotent repo); her tick'te guncel hali lazim.
+             cacheSize=-1 SART: varsayilan olarak pollEnrich file consumer'ini cache'liyor ve
+             consumer onceki poll'lardan kalan mesajlari kendi kuyrugunda tutuyor; ayni dosya
+             tick basina iki kez (FAZ 1 + FAZ 2) okundugu icin ESKI icerik donuyordu
+             (dogrulandi: bos staging yerine onceki 40 urunluk hali okundu). -1 ile her okuma
+             yeni bir consumer acar ve kapatir. -->
+        <pollEnrich id="aps-read-staging" timeout="3000" cacheSize="-1">
+            <constant>file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;noop=true&amp;idempotent=false&amp;readLock=none&amp;initialDelay=0</constant>
+        </pollEnrich>
+        <choice id="aps-choice-first-staging">
+            <when id="aps-when-no-staging">
+                <!-- Ilk calistirma (veya FAZ 2 dosyayi tuketip sildiyse): bos liste ile basla. -->
+                <simple>${body} == null</simple>
+                <setBody id="aps-set-empty-staging">
+                    <constant>[]</constant>
+                </setBody>
+            </when>
+        </choice>
+        <convertBodyTo id="aps-convert-staging" type="java.lang.String"/>
+        <unmarshal id="aps-unmarshal-staging">
+            <json library="Jackson"/>
+        </unmarshal>
+        <script id="aps-merge-staging">
+            <groovy>resource:file:merge-products-staging.groovy</groovy>
+        </script>
+        <marshal id="aps-marshal-staging">
+            <json library="Jackson" prettyPrint="true"/>
+        </marshal>
+        <!-- tempPrefix: yazma yarida kalirsa FAZ 2 yarim JSON okumasin (rename ile atomik). -->
+        <to id="aps-write-staging" uri="file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;fileExist=Override&amp;tempPrefix=.writing-"/>
+        <log id="aps-log-written" message="[product-sync] Staging dosyasina yazildi: ${exchangeProperty.stagingSize} urun toplam."/>
+    </route>
+
+    <!-- Checkpoint okuma: platform-state'ten son islenen (write_date, id) cursor'ini
+         JSON string olarak okur ({"last_write_date": "...", "last_id": N}). Iki alan
+         tek anahtarda tutuluyor ki yazma atomik olsun. -->
+    <route id="read-product-checkpoint-route">
+        <from id="rpc-from-direct" uri="direct:read-product-checkpoint"/>
+        <to id="rpc-platform-state-get" uri="platform-state:product-sync.cursor?operation=get"/>
+        <choice id="rpc-choice-first-run">
+            <when id="rpc-when-no-checkpoint">
+                <simple>${header.CamelyneStateFound} == false</simple>
+                <setBody id="rpc-set-initial-cursor">
+                    <simple>{"last_write_date":"{{vars.PRODUCT_SYNC_INITIAL_SINCE_DATE}}","last_id":0}</simple>
+                </setBody>
+            </when>
+        </choice>
+        <unmarshal id="rpc-unmarshal-cursor">
+            <json library="Jackson"/>
+        </unmarshal>
+    </route>
+
+    <!-- Checkpoint yazma: son islenen (write_date, id) platform-state'e yazilir. -->
+    <route id="write-product-checkpoint-route">
+        <from id="wpc-from-direct" uri="direct:write-product-checkpoint"/>
+        <!-- "} }" bosluklu: bkz. fetch-odoo-product-page-route. -->
+        <setBody id="wpc-set-body-cursor">
+            <simple>{"last_write_date":"${exchangeProperty.cursorWriteDate}","last_id":${exchangeProperty.cursorId} }</simple>
+        </setBody>
+        <to id="wpc-platform-state-put" uri="platform-state:product-sync.cursor?operation=put"/>
+    </route>
+
+    <!-- FAZ 2: staging dosyasindaki urunleri tek tek PrestaShop'a yazar. Bir urunun
+         hatasi digerlerini durdurmaz; basarisiz urunler staging'e geri yazilir,
+         basarililar staging'den duser. -->
+    <route id="push-staging-to-presta-route">
+        <from id="pts-from-direct" uri="direct:push-staging-to-presta"/>
+        <!-- Bilerek onException YOK: staging okunamaz/yazilamazsa poll route'un
+             psp-push-catch'i raporlasin. -->
+
+        <!-- cacheSize=-1: bkz. aps-read-staging (cache'li consumer eski icerik donduruyordu). -->
+        <pollEnrich id="pts-read-staging" timeout="3000" cacheSize="-1">
+            <constant>file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;noop=true&amp;idempotent=false&amp;readLock=none&amp;initialDelay=0</constant>
+        </pollEnrich>
+        <choice id="pts-choice-staging-exists">
+            <when id="pts-when-no-staging">
+                <simple>${body} == null</simple>
+                <setBody id="pts-set-empty-staging">
+                    <constant>[]</constant>
+                </setBody>
+            </when>
+        </choice>
+        <convertBodyTo id="pts-convert-staging" type="java.lang.String"/>
+        <unmarshal id="pts-unmarshal-staging">
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty id="pts-set-staging-total" name="stagingTotal">
+            <simple>${body.size()}</simple>
+        </setProperty>
+        <setProperty id="pts-init-failed-products" name="failedProducts">
+            <groovy>[]</groovy>
+        </setProperty>
+
+        <choice id="pts-choice-any-pending">
+            <when id="pts-when-pending">
+                <simple>${exchangeProperty.stagingTotal} &gt; 0</simple>
+                <log id="bp-presta-push-start" message="[product-sync] PrestaShop'a aktarilacak urun: ${exchangeProperty.stagingTotal}"/>
+
+                <split id="pts-split-products">
+                    <simple>${body}</simple>
+                    <setProperty id="pts-split-set-odoo-product" name="odooProduct">
+                        <simple>${body}</simple>
+                    </setProperty>
+                    <doTry id="pts-split-try">
+                        <to id="pts-split-to-push-one" uri="direct:push-one-product-to-presta"/>
+                        <doCatch id="pts-split-catch">
+                            <!-- Urunu (orijinal Odoo kaydi) staging'de tut, incident'i logla, siradakine gec. -->
+                            <exception>java.lang.Exception</exception>
+                            <script id="pts-split-catch-keep-failed">
+                                <groovy>exchange.getProperty('failedProducts').add(exchange.getProperty('odooProduct'))</groovy>
+                            </script>
+                            <setProperty id="pts-split-catch-set-route-id" name="errorRouteId">
+                                <simple>push-one-product-to-presta-route</simple>
+                            </setProperty>
+                            <setProperty id="pts-split-catch-set-message" name="errorMessage">
+                                <simple>odoo_product_id=${exchangeProperty.odooProduct[id]}: ${exception.message}</simple>
+                            </setProperty>
+                            <to id="pts-split-catch-to-handler" uri="direct:handle-product-sync-error"/>
+                        </doCatch>
+                    </doTry>
+                </split>
+
+                <!-- Staging'i sadece basarisiz urunlerle yeniden yaz (hepsi basariliysa bos dizi). -->
+                <setBody id="pts-set-body-failed">
+                    <simple>${exchangeProperty.failedProducts}</simple>
+                </setBody>
+                <marshal id="pts-marshal-failed">
+                    <json library="Jackson" prettyPrint="true"/>
+                </marshal>
+                <to id="pts-write-staging" uri="file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;fileExist=Override&amp;tempPrefix=.writing-"/>
+                <log id="pts-log-done" message="[product-sync] PrestaShop aktarimi bitti: ${exchangeProperty.stagingTotal} urun islendi, ${exchangeProperty.failedProducts.size()} basarisiz (staging'de kaldi)."/>
+            </when>
+            <otherwise id="pts-otherwise-nothing">
+                <log id="pts-log-nothing" message="[product-sync] Staging bos, PrestaShop'a aktarilacak urun yok."/>
+            </otherwise>
+        </choice>
+    </route>
+
+    <!-- Tek bir Odoo urununu (odooProduct property'si) PrestaShop'a yazar:
+           1) mpn=ODOO-<id> ile PrestaShop'ta ara
+           2) yoksa POST (tam kayit), varsa PATCH (sadece Odoo'nun sahip oldugu alanlar)
+           3) stoklu (is_storable) urunde stock_availables.quantity = qty_available
+           4) PrestaShop urununun gorseli yoksa Odoo image_256'yi yukle
+         Webservice cagrilari: allowOptimisedComponents="false" SART (bkz.
+         customer-sync-route.xml); authenticationPreemptive=true ile 401 + retry
+         turu atlanir. -->
+    <route id="push-one-product-to-presta-route">
+        <from id="pop-from-direct" uri="direct:push-one-product-to-presta"/>
+        <!-- Bilerek onException YOK: hata split'teki doCatch'e yukselsin (urun staging'de kalir). -->
+
+        <setProperty id="pop-set-mpn" name="prestaMpn">
+            <simple>ODOO-${exchangeProperty.odooProduct[id]}</simple>
+        </setProperty>
+        <setProperty id="pop-set-language-ids" name="prestaLanguageIds">
+            <simple>{{vars.PRESTA_LANGUAGE_IDS}}</simple>
+        </setProperty>
+        <setProperty id="pop-set-category-id" name="prestaCategoryId">
+            <simple>{{vars.PRESTA_DEFAULT_CATEGORY_ID}}</simple>
+        </setProperty>
+        <setProperty id="pop-set-tax-group-id" name="prestaTaxRulesGroupId">
+            <simple>{{vars.PRESTA_TAX_RULES_GROUP_ID}}</simple>
+        </setProperty>
+
+        <!-- 1) mpn ile ara -->
+        <removeHeaders id="pop-remove-headers-find" pattern="*"/>
+        <setHeader id="pop-set-method-find" name="CamelHttpMethod">
+            <constant>GET</constant>
+        </setHeader>
+        <toD id="pop-http-find-product" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/products?filter%5Bmpn%5D=%5B${exchangeProperty.prestaMpn}%5D&amp;display=%5Bid%2Cid_default_image%5D&amp;output_format=JSON&amp;authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+        <convertBodyTo id="pop-convert-find" type="java.lang.String"/>
+        <filter id="pop-filter-find-failed">
+            <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+            <throwException id="pop-throw-find-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop urun arama HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+        </filter>
+        <unmarshal id="pop-unmarshal-find">
+            <json library="Jackson"/>
+        </unmarshal>
+        <!-- Eslesme yoksa PrestaShop {"products":[...]} yerine bos dizi ([]) donuyor. -->
+        <choice id="pop-choice-found">
+            <when id="pop-when-found">
+                <simple>${body} is 'java.util.Map'</simple>
+                <setProperty id="pop-set-presta-id" name="prestaProductId">
+                    <simple>${body[products][0][id]}</simple>
+                </setProperty>
+                <setProperty id="pop-set-presta-image-id" name="prestaDefaultImageId">
+                    <simple>${body[products][0][id_default_image]}</simple>
+                </setProperty>
+            </when>
+        </choice>
+
+        <!-- 2) create / PATCH -->
+        <script id="pop-build-product-xml">
+            <groovy>resource:file:build-presta-product.groovy</groovy>
+        </script>
+        <removeHeaders id="pop-remove-headers-save" pattern="*"/>
+        <setHeader id="pop-set-content-type-save" name="Content-Type">
+            <constant>application/xml</constant>
+        </setHeader>
+        <choice id="pop-choice-create-or-patch">
+            <when id="pop-when-patch">
+                <simple>${exchangeProperty.prestaProductId} != null</simple>
+                <setHeader id="pop-set-method-patch" name="CamelHttpMethod">
+                    <constant>PATCH</constant>
+                </setHeader>
+                <toD id="pop-http-patch-product" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/products/${exchangeProperty.prestaProductId}?authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <convertBodyTo id="pop-convert-patch" type="java.lang.String"/>
+                <filter id="pop-filter-patch-failed">
+                    <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+                    <throwException id="pop-throw-patch-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop urun PATCH (id=${exchangeProperty.prestaProductId}) HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+                </filter>
+                <log id="pop-log-patched" message="[product-sync] PrestaShop urunu guncellendi: presta_id=${exchangeProperty.prestaProductId} ${exchangeProperty.prestaMpn}"/>
+            </when>
+            <otherwise id="pop-otherwise-create">
+                <setHeader id="pop-set-method-create" name="CamelHttpMethod">
+                    <constant>POST</constant>
+                </setHeader>
+                <to id="pop-http-create-product" uri="{{vars.PRESTA_BASE_URL}}/api/products?authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                <convertBodyTo id="pop-convert-create" type="java.lang.String"/>
+                <filter id="pop-filter-create-failed">
+                    <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+                    <throwException id="pop-throw-create-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop urun create HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+                </filter>
+                <setProperty id="pop-set-created-id" name="prestaProductId">
+                    <xpath resultType="java.lang.String">/prestashop/product/id/text()</xpath>
+                </setProperty>
+                <log id="pop-log-created" message="[product-sync] PrestaShop urunu olusturuldu: presta_id=${exchangeProperty.prestaProductId} ${exchangeProperty.prestaMpn}"/>
+            </otherwise>
+        </choice>
+
+        <!-- 3) Stok: sadece Odoo'da stok takibi olan urunlerde (servis/consumable'da
+             qty_available hep 0, yazmak urunu PrestaShop'ta stoksuz gosterirdi). -->
+        <filter id="pop-filter-storable">
+            <simple>${exchangeProperty.odooProduct[is_storable]} == true</simple>
+            <removeHeaders id="pop-remove-headers-stock-find" pattern="*"/>
+            <setHeader id="pop-set-method-stock-find" name="CamelHttpMethod">
+                <constant>GET</constant>
+            </setHeader>
+            <toD id="pop-http-find-stock" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/stock_availables?filter%5Bid_product%5D=%5B${exchangeProperty.prestaProductId}%5D&amp;filter%5Bid_product_attribute%5D=%5B0%5D&amp;display=%5Bid%5D&amp;output_format=JSON&amp;authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+            <convertBodyTo id="pop-convert-stock-find" type="java.lang.String"/>
+            <filter id="pop-filter-stock-find-failed">
+                <simple>${header.CamelHttpResponseCode} &gt;= 400 || ${body} !contains 'stock_availables'</simple>
+                <throwException id="pop-throw-stock-find-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop stock_available bulunamadi (presta_id=${exchangeProperty.prestaProductId}) HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+            </filter>
+            <unmarshal id="pop-unmarshal-stock-find">
+                <json library="Jackson"/>
+            </unmarshal>
+            <setProperty id="pop-set-stock-id" name="prestaStockId">
+                <simple>${body[stock_availables][0][id]}</simple>
+            </setProperty>
+            <!-- PrestaShop quantity tamsayi (isInt); Odoo qty_available float (3.0). -->
+            <setProperty id="pop-set-stock-qty" name="prestaQuantity">
+                <groovy>(long) Math.floor(exchange.getProperty('odooProduct').qty_available ?: 0)</groovy>
+            </setProperty>
+            <removeHeaders id="pop-remove-headers-stock-patch" pattern="*"/>
+            <setHeader id="pop-set-method-stock-patch" name="CamelHttpMethod">
+                <constant>PATCH</constant>
+            </setHeader>
+            <setHeader id="pop-set-content-type-stock-patch" name="Content-Type">
+                <constant>application/xml</constant>
+            </setHeader>
+            <setBody id="pop-set-body-stock-patch">
+                <simple><![CDATA[<?xml version="1.0" encoding="UTF-8"?><prestashop><stock_available><id>${exchangeProperty.prestaStockId}</id><quantity>${exchangeProperty.prestaQuantity}</quantity></stock_available></prestashop>]]></simple>
+            </setBody>
+            <toD id="pop-http-patch-stock" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/stock_availables/${exchangeProperty.prestaStockId}?authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+            <convertBodyTo id="pop-convert-stock-patch" type="java.lang.String"/>
+            <filter id="pop-filter-stock-patch-failed">
+                <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+                <throwException id="pop-throw-stock-patch-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop stok PATCH (presta_id=${exchangeProperty.prestaProductId}) HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+            </filter>
+            <log id="pop-log-stock" message="[product-sync] Stok guncellendi: presta_id=${exchangeProperty.prestaProductId} quantity=${exchangeProperty.prestaQuantity}"/>
+        </filter>
+
+        <!-- 4) Gorsel: sadece PrestaShop urununde varsayilan gorsel yoksa yukle (her
+             tick'te yeniden yuklemek ayni gorseli cogaltirdi). Odoo'da gorselin
+             degismesi bu yuzden PrestaShop'a yansimaz. -->
+        <filter id="pop-filter-needs-image">
+            <!-- image_256 Odoo'da gorsel yoksa false doner. prestaDefaultImageId yeni urunde
+                 hic set edilmez (null), mevcut gorselsiz urunde "" - groovy ikisini de false sayar. -->
+            <groovy>exchange.getProperty('odooProduct').image_256 instanceof String &amp;&amp; !exchange.getProperty('prestaDefaultImageId')</groovy>
+            <removeHeaders id="pop-remove-headers-image" pattern="*"/>
+            <setHeader id="pop-set-method-image" name="CamelHttpMethod">
+                <constant>POST</constant>
+            </setHeader>
+            <script id="pop-build-image-multipart">
+                <groovy>resource:file:build-presta-image-multipart.groovy</groovy>
+            </script>
+            <choice id="pop-choice-image-supported">
+                <when id="pop-when-image-supported">
+                    <simple>${exchangeProperty.prestaImageSupported} == true</simple>
+                    <toD id="pop-http-upload-image" allowOptimisedComponents="false" uri="{{vars.PRESTA_BASE_URL}}/api/images/products/${exchangeProperty.prestaProductId}?authMethod=Basic&amp;authUsername={{secrets.PRESTA_API_KEY}}&amp;authPassword=&amp;authenticationPreemptive=true&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+                    <convertBodyTo id="pop-convert-image" type="java.lang.String"/>
+                    <filter id="pop-filter-image-failed">
+                        <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+                        <throwException id="pop-throw-image-failed" exceptionType="java.lang.IllegalStateException" message="PrestaShop gorsel yukleme (presta_id=${exchangeProperty.prestaProductId}) HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+                    </filter>
+                    <log id="pop-log-image" message="[product-sync] Gorsel yuklendi: presta_id=${exchangeProperty.prestaProductId}"/>
+                </when>
+                <otherwise id="pop-otherwise-image-unsupported">
+                    <log id="pop-log-image-unsupported" loggingLevel="WARN" message="[product-sync] Odoo gorsel formati PrestaShop'ta desteklenmiyor (jpg/png/gif/webp degil), atlandi: ${exchangeProperty.prestaMpn}"/>
+                </otherwise>
+            </choice>
+        </filter>
+    </route>
+
+    <!-- Entegrasyon hatalarini tek noktadan, "CAMELYNE_INCIDENT" prefix'iyle loglar
+         (bkz. customer-sync-route.xml: handle-integration-error-route). Route id'si
+         ayri tutuldu ki iki entegrasyon ayni context'e yuklenirse cakismasin. -->
+    <route id="handle-product-sync-error-route">
+        <from id="hpe-from-direct" uri="direct:handle-product-sync-error"/>
+        <log id="hpe-log-incident" loggingLevel="ERROR" message="CAMELYNE_INCIDENT integration=product-sync route=${exchangeProperty.errorRouteId} exchangeId=${exchangeId} error=${exchangeProperty.errorMessage}"/>
+    </route>
+
+</routes>
