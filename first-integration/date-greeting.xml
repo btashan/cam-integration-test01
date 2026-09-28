@@ -11,6 +11,8 @@
         </setBody> 
         <setHeader name="test"><constant>test</constant> 
         </setHeader>
+        <setHeader name="metod"><constant>kart</constant>
+        </setHeader>
         <log message="${body}"/>
     </route>
 </routes>
