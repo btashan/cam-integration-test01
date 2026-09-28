@@ -1,0 +1,5 @@
+<routes>
+    <route id="new-route">
+        <from uri="direct:start"/>
+    </route>
+</routes>
