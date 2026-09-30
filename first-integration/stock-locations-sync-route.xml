@@ -1,0 +1,88 @@
+<routes>
+
+    <!-- NewStore Stock Locations senkronizasyonu (XML DSL).
+
+         Her {{vars.STOCK_LOCATIONS_SYNC_PERIOD_MS}} ms'de bir NewStore Inventory
+         Management API'sindeki stock location listesini ceker ve tamamini
+         {{vars.STOCK_LOCATIONS_OUTPUT_FILE}} adli JSON dosyasina yazar (her calismada
+         dosyanin tamami overwrite edilir - bu bir "son durumun anlik goruntusu"dur,
+         checkpoint/diff mantigi yoktur).
+
+         API: GET {{vars.NEWSTORE_BASE_URL}}/v0/d/stock_locations
+         https://docs.newstore.net/api/integration/inventory-management/stock_locations_api#tag/Stock-locations/operation/listStockLocations
+
+         NOT (dogrulanmasi gerekiyor): NewStore'un bircok "list" endpoint'i cursor
+         tabanli sayfalama kullanir (yanitta "next" alani / query'de "start_after"
+         gibi bir parametre). Stock locations tipik olarak az sayida kayit
+         icerdigi icin burada TEK sayfa cekiliyor (varsayilan limit). Eger sende
+         binlerce lokasyon varsa ve API sayfaliyorsa, "next" alanini okuyup
+         donen sayfalari birlestiren bir loop eklememiz gerekir - gercek yanit
+         ornegini paylasirsan ona gore genisletebiliriz.
+
+         Kimlik dogrulama: diger NewStore route'larindaki (transform-newstore-order.groovy)
+         kullanimla tutarli olmasi icin Bearer token varsayildi
+         (secrets.NEWSTORE_API_KEY). Eger tenant'inda NewStore OAuth2 client
+         credentials akisi kullaniyorsa (once /v0/token'dan access_token almak
+         gerekiyorsa) bunu ayri bir adimla eklememiz gerekir. -->
+
+    <route id="stock-locations-sync-route">
+        <from id="sls-from-timer" uri="timer:stockLocationsSyncTimer?period={{vars.STOCK_LOCATIONS_SYNC_PERIOD_MS}}"/>
+
+        <onException id="sls-on-exception">
+            <exception>java.lang.Exception</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setProperty id="sls-onerr-set-route-id" name="errorRouteId">
+                <simple>${routeId}</simple>
+            </setProperty>
+            <setProperty id="sls-onerr-set-message" name="errorMessage">
+                <simple>${exception.message}</simple>
+            </setProperty>
+            <to id="sls-onerr-to-handler" uri="direct:handle-stock-locations-sync-error"/>
+        </onException>
+
+        <log id="bp-stock-locations-start" message="[stock-locations-sync] Senkronizasyon basladi."/>
+
+        <removeHeaders id="sls-remove-headers" pattern="*"/>
+        <setHeader id="sls-set-method" name="CamelHttpMethod">
+            <constant>GET</constant>
+        </setHeader>
+        <setHeader id="sls-set-authorization" name="Authorization">
+            <simple>Bearer {{secrets.NEWSTORE_API_KEY}}</simple>
+        </setHeader>
+        <setHeader id="sls-set-accept" name="Accept">
+            <constant>application/json</constant>
+        </setHeader>
+
+        <toD id="sls-http-list-stock-locations" allowOptimisedComponents="false" uri="{{vars.NEWSTORE_BASE_URL}}/v0/d/stock_locations?limit={{vars.STOCK_LOCATIONS_PAGE_SIZE}}&amp;bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
+        <convertBodyTo id="sls-convert-response" type="java.lang.String"/>
+
+        <!-- throwExceptionOnFailure=false: hata govdesini (NewStore error mesaji) loga
+             koyabilmek icin elle firlat. -->
+        <filter id="sls-filter-failed">
+            <simple>${header.CamelHttpResponseCode} &gt;= 400</simple>
+            <throwException id="sls-throw-failed" exceptionType="java.lang.IllegalStateException" message="NewStore stock_locations HTTP ${header.CamelHttpResponseCode}: ${body}"/>
+        </filter>
+
+        <!-- Yaniti parse edip tekrar guzel bicimlendirilmis (pretty) JSON olarak yaz. -->
+        <unmarshal id="sls-unmarshal-response">
+            <json library="Jackson"/>
+        </unmarshal>
+        <marshal id="sls-marshal-pretty">
+            <json library="Jackson" prettyPrint="true"/>
+        </marshal>
+
+        <to id="sls-to-file" uri="file:{{vars.STOCK_LOCATIONS_OUTPUT_DIR}}?fileName={{vars.STOCK_LOCATIONS_OUTPUT_FILE}}&amp;fileExist=Override"/>
+
+        <log id="sls-log-done" message="[stock-locations-sync] Senkronizasyon bitti, dosyaya yazildi: {{vars.STOCK_LOCATIONS_OUTPUT_DIR}}/{{vars.STOCK_LOCATIONS_OUTPUT_FILE}}"/>
+    </route>
+
+    <!-- Entegrasyon hatalarini tek noktadan, "CAMELYNE_INCIDENT" prefix'iyle loglar
+         (bkz. customer-sync-route.xml / product-sync-route.xml: ayni desen). -->
+    <route id="handle-stock-locations-sync-error-route">
+        <from id="hsle-from-direct" uri="direct:handle-stock-locations-sync-error"/>
+        <log id="hsle-log-incident" loggingLevel="ERROR" message="CAMELYNE_INCIDENT integration=stock-locations-sync route=${exchangeProperty.errorRouteId} exchangeId=${exchangeId} error=${exchangeProperty.errorMessage}"/>
+    </route>
+
+</routes>
