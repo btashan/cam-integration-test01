@@ -128,7 +128,7 @@
                 <to id="csp-lock-release" uri="platform-lock:customer-sync?operation=release"/>
             </doFinally>
         </doTry>
-    </route>
+    </route><route id="route-6"><from uri="timer:"/><setHeader disabled="false"><simple/></setHeader><setBody disabled="false"><simple/></setBody></route>
 
     <!-- Tek bir PrestaShop customer'ini Odoo'da bul/olustur/guncelle.
          Gelen body: [id, firstname, lastname, email, dateUpd] Map'i.
