@@ -13,6 +13,6 @@
         </setHeader>
         <setHeader name="metod"><constant>kart</constant>
         </setHeader>
-        <log message="${body}"/>
+        <log message="${body}"/><choice disabled="false" precondition="false"/>
     </route>
 </routes>
