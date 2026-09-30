@@ -1,16 +1,17 @@
+<!-- DEPS org.apache.camel:camel-salesforce:4.8.0 -->
+<!-- COMPONENT salesforce -->
 <routes>
 
     <!-- Odoo -> PrestaShop urun senkronizasyonu (XML DSL).
 
          FAZ 1: Odoo'da write_date'i checkpoint'ten sonra olan product.product
          kayitlarini sayfa sayfa ({{vars.PRODUCT_SYNC_PAGE_SIZE}} kayit) ceker ve
-         hepsini ortak bir staging JSON dosyasina
-         ({{vars.PRODUCT_SYNC_STAGING_DIR}}/{{vars.PRODUCT_SYNC_STAGING_FILE_NAME}})
-         id bazinda upsert eder.
-         FAZ 2: staging dosyasindaki her urunu PrestaShop'a yazar (create/PATCH +
+         hepsini platform-state'te tutulan ortak bir staging listesine
+         (product-sync.staging) id bazinda upsert eder.
+         FAZ 2: staging listesindeki her urunu PrestaShop'a yazar (create/PATCH +
          stok + gorsel). Basarili olanlar staging'den silinir, basarisizlar kalir
          ve bir sonraki tick'te yeniden denenir. Iki faz ayni tick'te ve ayni
-         platform-lock altinda calisir; boylece staging dosyasina ayni anda iki
+         platform-lock altinda calisir; boylece staging state'ine ayni anda iki
          yazan olmaz.
 
          Eslestirme: PrestaShop urununun mpn alani "ODOO-<odoo product id>" tutar
@@ -25,8 +26,7 @@
 
          Kullanilan degiskenler:
            vars.PRODUCT_SYNC_PERIOD_MS, vars.PRODUCT_SYNC_PAGE_SIZE,
-           vars.PRODUCT_SYNC_INITIAL_SINCE_DATE, vars.PRODUCT_SYNC_STAGING_DIR,
-           vars.PRODUCT_SYNC_STAGING_FILE_NAME, vars.ODOO_BASE_URL, vars.ODOO_DB,
+           vars.PRODUCT_SYNC_INITIAL_SINCE_DATE, vars.ODOO_BASE_URL, vars.ODOO_DB,
            vars.HTTP_CONNECT_TIMEOUT_MS, vars.HTTP_SOCKET_TIMEOUT_MS,
            vars.PRESTA_BASE_URL, vars.PRESTA_LANGUAGE_IDS (virgullu, ornegin "1,2"),
            vars.PRESTA_DEFAULT_CATEGORY_ID, vars.PRESTA_TAX_RULES_GROUP_ID,
@@ -34,7 +34,7 @@
            secrets.PRESTA_API_KEY (webservice key) -->
 
     <!-- ANA ROUTE: checkpoint'i (platform-state) okur, Odoo'dan degisen urunleri
-         sayfa sayfa ceker, staging dosyasina ekler, checkpoint'i son islenen
+         sayfa sayfa ceker, staging state'ine ekler, checkpoint'i son islenen
          (write_date, id)'ye ilerletir (FAZ 1); ardindan staging'i PrestaShop'a
          aktarir (FAZ 2). Kritik bolge platform-lock ile korunur. -->
     <route id="product-sync-poll-route">
@@ -131,7 +131,6 @@
                     <log id="psp-log-push-failed" loggingLevel="WARN" message="[product-sync] PrestaShop aktarimi basarisiz, staging dosyasi korunuyor; bir sonraki tick yeniden denenecek."/>
                 </doCatch>
             </doTry>
-
             <doCatch id="psp-catch">
                 <exception>java.lang.Exception</exception>
                 <setProperty id="psp-catch-set-route-id" name="errorRouteId">
@@ -176,7 +175,7 @@
              Sondaki "} }" bosluklu: yan yana "}}" property placeholder kapanisi
              sanilip route baslatilamiyor ("Missing {{ from the text"). -->
         <setBody id="fop-set-body-search-read">
-            <simple>{"domain":["|",["write_date",">","${exchangeProperty.cursorWriteDate}"],"&amp;",["write_date","=","${exchangeProperty.cursorWriteDate}"],["id",">",${exchangeProperty.cursorId}]],"fields":["id","name","display_name","lst_price","default_code","code","partner_ref","active","barcode","image_256","write_date","tax_string","qty_available","description","type","list_price","currency_id","is_storable","service_to_purchase"],"limit":{{vars.PRODUCT_SYNC_PAGE_SIZE}},"order":"write_date asc, id asc","context":{"active_test":false} }</simple>
+            <simple>{"domain":["|",["write_date","&gt;","${exchangeProperty.cursorWriteDate}"],"&amp;",["write_date","=","${exchangeProperty.cursorWriteDate}"],["id","&gt;",${exchangeProperty.cursorId}]],"fields":["id","name","display_name","lst_price","default_code","code","partner_ref","active","barcode","image_256","write_date","tax_string","qty_available","description","type","list_price","currency_id","is_storable","service_to_purchase"],"limit":{{vars.PRODUCT_SYNC_PAGE_SIZE}},"order":"write_date asc, id asc","context":{"active_test":false} }</simple>
         </setBody>
         <to id="fop-call-odoo-search-read" uri="{{vars.ODOO_BASE_URL}}/json/2/product.product/search_read?bridgeEndpoint=true&amp;throwExceptionOnFailure=false&amp;connectTimeout={{vars.HTTP_CONNECT_TIMEOUT_MS}}&amp;soTimeout={{vars.HTTP_SOCKET_TIMEOUT_MS}}"/>
         <convertBodyTo id="fop-convert-response" type="java.lang.String"/>
@@ -212,33 +211,24 @@
         <log id="fop-log-page" message="[product-sync] Sayfa alindi: ${exchangeProperty.lastPageSize} urun, cursor=(${exchangeProperty.cursorWriteDate}, ${exchangeProperty.cursorId})"/>
     </route>
 
-    <!-- Staging dosyasi: FAZ 2'nin (PrestaShop'a yazma) okuyacagi ortak JSON dizisi.
-         Mevcut dosya okunur, bu tick'te gelen urunler id bazinda upsert edilir
-         (merge-products-staging.groovy), dosya bastan yazilir. -->
+    <!-- Staging state'i: FAZ 2'nin (PrestaShop'a yazma) okuyacagi ortak JSON dizisi,
+         platform-state'te "product-sync.staging" anahtari altinda tutulur. Mevcut
+         durum okunur, bu tick'te gelen urunler id bazinda upsert edilir
+         (merge-products-staging.groovy), state bastan yazilir. -->
     <route id="append-products-to-staging-route">
         <from id="aps-from-direct" uri="direct:append-products-to-staging"/>
         <!-- Bilerek onException YOK: yazma basarisizsa checkpoint ilerlemesin. -->
 
-        <!-- idempotent=false: noop=true tek basina ayni dosyayi ikinci kez okumayi
-             engelleyebiliyor (in-memory idempotent repo); her tick'te guncel hali lazim.
-             cacheSize=-1 SART: varsayilan olarak pollEnrich file consumer'ini cache'liyor ve
-             consumer onceki poll'lardan kalan mesajlari kendi kuyrugunda tutuyor; ayni dosya
-             tick basina iki kez (FAZ 1 + FAZ 2) okundugu icin ESKI icerik donuyordu
-             (dogrulandi: bos staging yerine onceki 40 urunluk hali okundu). -1 ile her okuma
-             yeni bir consumer acar ve kapatir. -->
-        <pollEnrich id="aps-read-staging" timeout="3000" cacheSize="-1">
-            <constant>file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;noop=true&amp;idempotent=false&amp;readLock=none&amp;initialDelay=0</constant>
-        </pollEnrich>
+        <to id="aps-read-staging" uri="platform-state:product-sync.staging?operation=get"/>
         <choice id="aps-choice-first-staging">
             <when id="aps-when-no-staging">
-                <!-- Ilk calistirma (veya FAZ 2 dosyayi tuketip sildiyse): bos liste ile basla. -->
-                <simple>${body} == null</simple>
+                <!-- Ilk calistirma (veya FAZ 2 state'i tuketip sildiyse): bos liste ile basla. -->
+                <simple>${header.CamelyneStateFound} == false</simple>
                 <setBody id="aps-set-empty-staging">
                     <constant>[]</constant>
                 </setBody>
             </when>
         </choice>
-        <convertBodyTo id="aps-convert-staging" type="java.lang.String"/>
         <unmarshal id="aps-unmarshal-staging">
             <json library="Jackson"/>
         </unmarshal>
@@ -246,11 +236,10 @@
             <groovy>resource:file:merge-products-staging.groovy</groovy>
         </script>
         <marshal id="aps-marshal-staging">
-            <json library="Jackson" prettyPrint="true"/>
+            <json library="Jackson"/>
         </marshal>
-        <!-- tempPrefix: yazma yarida kalirsa FAZ 2 yarim JSON okumasin (rename ile atomik). -->
-        <to id="aps-write-staging" uri="file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;fileExist=Override&amp;tempPrefix=.writing-"/>
-        <log id="aps-log-written" message="[product-sync] Staging dosyasina yazildi: ${exchangeProperty.stagingSize} urun toplam."/>
+        <to id="aps-write-staging" uri="platform-state:product-sync.staging?operation=put"/>
+        <log id="aps-log-written" message="[product-sync] Staging state'ine yazildi: ${exchangeProperty.stagingSize} urun toplam."/>
     </route>
 
     <!-- Checkpoint okuma: platform-state'ten son islenen (write_date, id) cursor'ini
@@ -290,19 +279,15 @@
         <!-- Bilerek onException YOK: staging okunamaz/yazilamazsa poll route'un
              psp-push-catch'i raporlasin. -->
 
-        <!-- cacheSize=-1: bkz. aps-read-staging (cache'li consumer eski icerik donduruyordu). -->
-        <pollEnrich id="pts-read-staging" timeout="3000" cacheSize="-1">
-            <constant>file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;noop=true&amp;idempotent=false&amp;readLock=none&amp;initialDelay=0</constant>
-        </pollEnrich>
+        <to id="pts-read-staging" uri="platform-state:product-sync.staging?operation=get"/>
         <choice id="pts-choice-staging-exists">
             <when id="pts-when-no-staging">
-                <simple>${body} == null</simple>
+                <simple>${header.CamelyneStateFound} == false</simple>
                 <setBody id="pts-set-empty-staging">
                     <constant>[]</constant>
                 </setBody>
             </when>
         </choice>
-        <convertBodyTo id="pts-convert-staging" type="java.lang.String"/>
         <unmarshal id="pts-unmarshal-staging">
             <json library="Jackson"/>
         </unmarshal>
@@ -347,9 +332,9 @@
                     <simple>${exchangeProperty.failedProducts}</simple>
                 </setBody>
                 <marshal id="pts-marshal-failed">
-                    <json library="Jackson" prettyPrint="true"/>
+                    <json library="Jackson"/>
                 </marshal>
-                <to id="pts-write-staging" uri="file:{{vars.PRODUCT_SYNC_STAGING_DIR}}?fileName={{vars.PRODUCT_SYNC_STAGING_FILE_NAME}}&amp;fileExist=Override&amp;tempPrefix=.writing-"/>
+                <to id="pts-write-staging" uri="platform-state:product-sync.staging?operation=put"/>
                 <log id="pts-log-done" message="[product-sync] PrestaShop aktarimi bitti: ${exchangeProperty.stagingTotal} urun islendi, ${exchangeProperty.failedProducts.size()} basarisiz (staging'de kaldi)."/>
             </when>
             <otherwise id="pts-otherwise-nothing">
