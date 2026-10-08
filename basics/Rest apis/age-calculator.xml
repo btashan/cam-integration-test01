@@ -1,0 +1,84 @@
+<!-- DEPS org.apache.camel:camel-rest:4.8.0 --><!-- COMPONENT rest --><routes>
+    <!-- COMPONENT platform-timer -->
+    <!-- COMPONENT platform-queue -->
+    <!-- REST Endpoint Tanımı -->
+    <!-- REST Endpoint Tanımı -->
+    <onException>
+        <exception>java.lang.Exception</exception>
+        <handled>
+            <constant>true</constant>
+        </handled>
+        <log loggingLevel="ERROR" message="Request failed: ${exception.message}"/>
+        <setHeader name="CamelHttpResponseCode">
+            <constant>500</constant>
+        </setHeader>
+        <setBody>
+            <groovy>[status: "ERROR", message: 'An unexpected error occurred.']</groovy>
+        </setBody>
+    </onException>
+    <onException>
+        <exception>java.lang.Exception</exception>
+        <handled>
+            <constant>true</constant>
+        </handled>
+        <log loggingLevel="ERROR" message="Request failed: ${exception.message}"/>
+        <setHeader name="CamelHttpResponseCode">
+            <constant>500</constant>
+        </setHeader>
+        <setBody>
+            <groovy>[status: "ERROR", message: 'An unexpected error occurred.']</groovy>
+        </setBody>
+    </onException>
+    <rest path="/hello">
+        
+        <get path="/hi" bindingMode="json">
+            <to uri="direct:hesapla"/>
+        </get>
+        
+    </rest>
+    <!-- İş Mantığı Rotalaması -->
+    <route id="helloHesaplaRoute">
+        <from uri="direct:hesapla"/>
+        <setHeader disabled="true">
+            <constant/>
+        </setHeader>
+        <!-- Groovy Scripting -->
+        <setBody>
+            <groovy>
+                def isim = request.headers.get("isim")
+                def r = "hello"
+                def dogumTarihiStr = request.headers.get("dogumTarihi")
+
+                if (!isim || !dogumTarihiStr) {
+                    return [
+                        status: "ERROR",
+                        message: "Lutfen   'isim' ve 'dogumTarihi' (YYYY-MM-DD) parametrelerini girin."
+                    ]
+                }
+
+                def dogumTarihi = java.time.LocalDate.parse(dogumTarihiStr)
+                def yas = java.time.Period.between(dogumTarihi, java.time.LocalDate.now()).years
+
+                return [
+                    isim: isim,
+                    yas: yas,
+                    mesaj: "Merhaba " + isim + ", " + yas + " yasindasiniz."
+                ]
+            </groovy>
+        </setBody>
+        <doTry disabled="false">
+            <setBody disabled="false">
+                <simple/>
+            </setBody>
+            <doCatch>
+                <exception>java.lang.Exception</exception>
+            </doCatch>
+            <doFinally>
+                <removeHeader disabled="false"/>
+            </doFinally>
+        </doTry>
+    </route>
+    <route id="route-2">
+        
+    </route>
+</routes>
