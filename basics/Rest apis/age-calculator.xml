@@ -15,9 +15,6 @@
     <!-- İş Mantığı Rotalaması -->
     <route id="helloHesaplaRoute">
         <from uri="direct:hesapla"/>
-        <setHeader>
-            <constant/>
-        </setHeader>
         <!-- Groovy Scripting -->
         <setBody>
             <groovy>
