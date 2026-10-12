@@ -1,0 +1,173 @@
+<!-- COMPONENT platform-timer --><!-- COMPONENT platform-state --><!-- COMPONENT platform-queue --><routes xmlns="http://camel.apache.org/schema/spring">
+    <!--
+      Customer Sync - Producer (polling only, per scope of this task)
+      ================================================================
+      Runs every 5 minutes, finds customer records created OR updated
+      after the last watermark, and pushes them in strict chronological
+      order onto "customers-sync-queue" with their FULL field set (rich
+      payload), so this is a true full-sync producer (inserts + updates).
+      The consumer (upsert + watermark advance) is intentionally NOT
+      part of this route.
+
+      Uses Camelyne platform-native components instead of raw Camel
+      ones:
+        - platform-timer  -> cron scheduling (replaces camel-quartz)
+        - platform-state  -> persisted key/value flags (replaces a
+                              local caffeine cache), used for both
+                              the mutex (is_customer_sync_running)
+                              and the watermark
+                              (last_successful_sync_timestamp)
+        - platform-queue  -> pushes onto the platform QUEUE resource
+                              (res_77ps5fhb). Adjust the queue
+                              identifier below ("customers-sync-queue")
+                              if the resource's code differs.
+
+      Source connector: real endpoint confirmed, returns XML (NOT JSON):
+        - GET http://34.156.146.117:8080/api/customers
+          ?date=1&filter[date_upd]=[start,end]&display=full
+          (range filter, "yyyy-MM-dd HH:mm:ss"); start = watermark,
+          end = now (UTC).
+          filter is on date_upd (not date_add) on purpose: in
+          PrestaShop date_upd is also stamped at creation time, so a
+          single filter on date_upd catches BOTH new and modified
+          customers -> full sync with one query.
+          display=full is required so the list call returns the
+          complete <customer> element (all fields), not just the
+          id/xlink:href stub.
+        - Auth: Basic, value kept as integration secret
+          "PRESTA_API_KEY" (set it under the Secrets tab), referenced
+          here as {{secrets.PRESTA_API_KEY}} — never hardcode the
+          credential in this file.
+        - last_successful_sync_timestamp is only READ here (UTC
+          ISO-8601 string); the future consumer route is the one
+          that advances it via platform-state after a successful
+          upsert.
+
+      Response shape example (customers wrapped under <prestashop>):
+        <prestashop xmlns:xlink="...">
+          <customers>
+            <customer>
+              <id>1</id>
+              <date_add>2024-01-01 10:00:00</date_add>
+              <date_upd>2024-05-01 12:00:00</date_upd>
+              <email>...</email>
+              ... (other fields depending on PrestaShop config)
+            </customer>
+          </customers>
+        </prestashop>
+      Fields are parsed dynamically with Groovy's XmlSlurper below, so
+      every field PrestaShop returns is kept as-is (rich payload) and
+      forwarded to the queue, without hardcoding a fixed field list.
+    -->
+    <route id="customer-sync-producer">
+        <from uri="platform-timer://customerSync?cron=0%2B0%2F5%2B*%2B*%2B*%2B%3F&amp;timeZone=UTC"/>
+
+        <log loggingLevel="INFO" message="Customer sync tick started {body}"/>
+
+        <!-- 1. Mutex guard: is a previous run still in progress? -->
+        <to uri="platform-state://is_customer_sync_running?action=get&amp;operation=get"/>
+
+        <choice>
+            <when>
+                <simple>${body} == 'true'</simple>
+                <log loggingLevel="INFO" message="Entegrasyon zaten çalışıyor, bu tetikleme atlanıyor (is_customer_sync_running=true)"/>
+            </when>
+            <otherwise>
+                <doTry>
+                    <!-- acquire the lock; TTL expires it after 10 min in case the worker crashes -->
+                    <setBody>
+                        <constant>true</constant>
+                    </setBody>
+                    <to uri="platform-state://is_customer_sync_running?action=set&amp;ttlSeconds=600"/>
+
+                    <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
+                    <to uri="platform-state://last_successful_sync_timestamp?action=get"/>
+                    <setHeader name="watermark">
+                        <simple>${body}</simple>
+                    </setHeader>
+
+                    <!-- Source API expects a date_upd range filter: [start,end] in "yyyy-MM-dd HH:mm:ss" -->
+                    <setHeader name="rangeStart">
+                        <groovy>java.time.OffsetDateTime.parse(request.headers['watermark'] as String).format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))</groovy>
+                    </setHeader>
+                    <setHeader name="rangeEnd">
+                        <simple>${date:now:yyyy-MM-dd HH:mm:ss}</simple>
+                    </setHeader>
+
+                    <setHeader name="CamelHttpMethod">
+                        <constant>GET</constant>
+                    </setHeader>
+                    <!-- Basic auth value is stored as an integration secret, NOT hardcoded here -->
+                    <setHeader name="Authorization">
+                        <constant>{{secrets.PRESTA_API_KEY}}</constant>
+                    </setHeader>
+
+                    <!-- Path concat safety: vars.PRESTA_BASE_URL may or may not end with "/".
+                         Camel has no built-in path-join, so normalize manually: strip any
+                         trailing slashes then add exactly one, so appending "api/customers"
+                         below never produces a missing or doubled slash. -->
+                    <setHeader name="prestaBaseUrl">
+                        <simple>{{vars.PRESTA_BASE_URL}}</simple>
+                    </setHeader>
+                    <setHeader name="prestaBaseUrl">
+                        <groovy>(headers.prestaBaseUrl as String).replaceAll('/+$', '') + '/'</groovy>
+                    </setHeader>
+
+                    <toD uri="${header.prestaBaseUrl}api/customers?date=1&amp;filter[date_upd]=[${header.rangeStart},${header.rangeEnd}]&amp;display=full"/>
+
+                    <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
+                    <script>
+                        <groovy>
+                            def xml = new groovy.util.XmlSlurper().parseText(body as String)
+                            def customers = xml.customers.customer.collect { c ->
+                                def map = [:]
+                                c.children().each { field ->
+                                    map[field.name()] = field.text()
+                                }
+                                map
+                            }
+                            // 3. Guarantee strict FIFO: sort ascending by date_upd before enqueueing
+                            customers.sort { it.date_upd }
+                            customers
+                        </groovy>
+                    </script>
+
+                    <log loggingLevel="INFO" message="Fetched ${body.size()} created/updated customer(s)"/>
+
+                    <split>
+                        <simple>${body}</simple>
+                        <!-- Keep ALL fields PrestaShop returned (rich data) and add a convenience url
+                             pointing at the REAL source record (same base URL used to fetch it,
+                             split exchanges inherit headers from the parent, so prestaBaseUrl is available) -->
+                        <script>
+                            <groovy>
+                                body['url'] = (headers.prestaBaseUrl as String) + "api/customers/" + body['id']
+                                body
+                            </groovy>
+                        </script>
+                        <marshal>
+                            <json library="Jackson"/>
+                        </marshal>
+                        <log loggingLevel="DEBUG" message="Enqueueing customer ${body}"/>
+                        <to uri="platform-queue://customers-sync-queue"/>
+                    </split>
+
+                    <doCatch>
+                        <exception>java.lang.Exception</exception>
+                        <log loggingLevel="ERROR" message="Customer sync polling failed: ${exception.message}"/>
+                        
+                    </doCatch>
+                    <doFinally>
+                        <!-- 4. Always release the mutex, success or failure -->
+                        <setBody>
+                            <constant>false</constant>
+                        </setBody>
+                        <to uri="platform-state://is_customer_sync_running?action=set"/>
+                        
+                    </doFinally>
+                </doTry>
+            </otherwise>
+        </choice>
+    </route>
+    
+</routes>
