@@ -78,7 +78,7 @@
                     <setBody>
                         <constant>true</constant>
                     </setBody>
-                    <to uri="platform-state://is_customer_sync_running?operation=set&amp;ttlSeconds=600"/>
+                    <to uri="platform-state://is_customer_sync_running?operation=put&amp;ttlSeconds=600"/>
 
                     <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
                     <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
@@ -162,7 +162,7 @@
                         <setBody>
                             <constant>false</constant>
                         </setBody>
-                        <to uri="platform-state://is_customer_sync_running?operation=set"/>
+                        <to uri="platform-state://is_customer_sync_running?operation=put"/>
                         
                     </doFinally>
                 </doTry>
