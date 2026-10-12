@@ -60,7 +60,7 @@
       forwarded to the queue, without hardcoding a fixed field list.
     -->
     <route id="customer-sync-producer">
-        <from uri="platform-timer://customerSync?cron=0%2B0%2F5%2B*%2B*%2B*%2B%3F&amp;timeZone=UTC"/>
+        <from uri="platform-timer://customerSync?cron=*%2F5+*+*+*+*&amp;timeZone=UTC"/> 
 
         <log loggingLevel="INFO" message="Customer sync tick started {body}"/>
 
