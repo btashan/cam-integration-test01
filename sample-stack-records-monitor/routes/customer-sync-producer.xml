@@ -65,7 +65,7 @@
         <log loggingLevel="INFO" message="Customer sync tick started {body}"/>
 
         <!-- 1. Mutex guard: is a previous run still in progress? -->
-        <to uri="platform-state://is_customer_sync_running?action=get&amp;operation=get"/>
+        <to uri="platform-state://is_customer_sync_running?operation=get"/>
 
         <choice>
             <when>
@@ -78,10 +78,10 @@
                     <setBody>
                         <constant>true</constant>
                     </setBody>
-                    <to uri="platform-state://is_customer_sync_running?action=set&amp;ttlSeconds=600"/>
+                    <to uri="platform-state://is_customer_sync_running?operation=set&amp;ttlSeconds=600"/>
 
                     <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
-                    <to uri="platform-state://last_successful_sync_timestamp?action=get"/>
+                    <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
                     <setHeader name="watermark">
                         <simple>${body}</simple>
                     </setHeader>
@@ -162,7 +162,7 @@
                         <setBody>
                             <constant>false</constant>
                         </setBody>
-                        <to uri="platform-state://is_customer_sync_running?action=set"/>
+                        <to uri="platform-state://is_customer_sync_running?operation=set"/>
                         
                     </doFinally>
                 </doTry>
