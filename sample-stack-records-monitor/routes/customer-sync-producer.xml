@@ -1,4 +1,6 @@
-<!-- COMPONENT platform-timer --><!-- COMPONENT platform-state --><!-- COMPONENT platform-queue --><routes xmlns="http://camel.apache.org/schema/spring">
+<!-- DEPS org.apache.camel:camel-google-secret-manager:4.18.0 --><!-- DEPS org.apache.camel:camel-google-sheets:4.18.0 --><!-- COMPONENT platform-timer --><!-- COMPONENT platform-state --><!-- COMPONENT platform-queue --><routes xmlns="http://camel.apache.org/schema/spring">
+<!-- COMPONENT google-secret-manager -->
+<!-- COMPONENT google-sheets -->
     <!--
       Customer Sync - Producer (polling only, per scope of this task)
       ================================================================
@@ -119,9 +121,9 @@
                     <script>
                         <groovy>
                             def xml = new groovy.util.XmlSlurper().parseText(body as String)
-                            def customers = xml.customers.customer.collect { c ->
+                            def customers = xml.customers.customer.collect { c -&gt;
                                 def map = [:]
-                                c.children().each { field ->
+                                c.children().each { field -&gt;
                                     map[field.name()] = field.text()
                                 }
                                 map
@@ -169,5 +171,4 @@
             </otherwise>
         </choice>
     </route>
-    
 </routes>
