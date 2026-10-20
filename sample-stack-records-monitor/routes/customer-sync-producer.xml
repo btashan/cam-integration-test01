@@ -1,6 +1,5 @@
-<!-- DEPS com.camelyne:platform-components:0.2 -->
-<!-- COMPONENT platform-timer -->
-<routes xmlns="http://camel.apache.org/schema/spring">
+<!-- DEPS com.camelyne:platform-components:0.2 --><!-- COMPONENT platform-timer --><routes xmlns="http://camel.apache.org/schema/spring">
+<!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue" -->
   <!--
       Customer Sync - Producer (polling only, per scope of this task)
       ================================================================
@@ -62,7 +61,7 @@
       forwarded to the queue, without hardcoding a fixed field list.
     -->
   <route id="customer-sync-producer">
-    <from uri="platform-timer://customerSync?cron=*%2F5+*+*+*+*&amp;timeZone=UTC"/>
+    <from uri="platform-timer://customerSync?cron=*%2F1%20*%20*%20*%20*&amp;timeZone=UTC"/>
     <log loggingLevel="INFO" message="Customer sync tick started {body}"/>
     <!-- 1. Mutex guard: is a previous run still in progress? -->
     <to uri="platform-state://is_customer_sync_running?operation=get"/>
