@@ -115,6 +115,8 @@
           </setHeader>
           <toD uri="${header.prestaBaseUrl}api/customers?date=1&amp;filter[date_upd]=[${header.rangeStart},${header.rangeEnd}]&amp;display=full"/>
           <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
+          <convertBodyTo type="java.lang.String"/>
+          <log loggingLevel="INFO" message="Presta response (ilk 300 karakter): ${body.substring(0, 300)}"/>
           <script>
             <groovy>
                             def xml = new groovy.xml.XmlSlurper().parseText(body as String)
