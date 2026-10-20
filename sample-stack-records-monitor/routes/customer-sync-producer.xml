@@ -82,7 +82,7 @@
           <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
           <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
           <setHeader name="watermark">
-            <simple>${body}</simple>
+            <simple>${body}</simple> 
           </setHeader>
           <!-- Source API expects a date_upd range filter: [start,end] in "yyyy-MM-dd HH:mm:ss" -->
           <setHeader name="rangeStart">
@@ -94,14 +94,14 @@
           <setHeader name="rangeEnd">
             <simple>${date:now:yyyy-MM-dd HH:mm:ss}</simple>
           </setHeader>
-          <removeHeaders pattern="*" excludePattern="watermark|rangeStart|rangeEnd"/> 
-          <removeHeaders pattern="CamelHttp*"/> 
+          <removeHeaders pattern="*" excludePattern="watermark|rangeStart|rangeEnd"/>
+          <removeHeaders pattern="CamelHttp*"/>
           <setHeader name="CamelHttpMethod">
             <constant>GET</constant>
           </setHeader>
           <!-- Basic auth value is stored as an integration secret, NOT hardcoded here -->
           <setHeader name="Authorization">
-            <constant>{{secrets.PRESTA_API_KEY}}</constant>
+            <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
           </setHeader>
           <!-- Path concat safety: vars.PRESTA_BASE_URL may or may not end with "/".
                          Camel has no built-in path-join, so normalize manually: strip any
