@@ -117,7 +117,7 @@
           <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
           <convertBodyTo type="java.lang.String"/>
           <log loggingLevel="INFO" message="Presta response (ilk 300 karakter): ${body.substring(0, 300)}"/>
-          <script>
+          <setBody>
             <groovy>
                             def xml = new groovy.xml.XmlSlurper().parseText(body as String)
                             def customers = xml.customers.customer.collect { c -&gt;
@@ -131,19 +131,19 @@
                             customers.sort { it.date_upd }
                             customers
                         </groovy>
-          </script>
+          </setBody>
           <log loggingLevel="INFO" message="Fetched ${body.size()} created/updated customer(s)"/>
           <split>
             <simple>${body}</simple>
             <!-- Keep ALL fields PrestaShop returned (rich data) and add a convenience url
                              pointing at the REAL source record (same base URL used to fetch it,
                              split exchanges inherit headers from the parent, so prestaBaseUrl is available) -->
-            <script>
+            <setBody>
               <groovy>
                                 body['url'] = (headers.prestaBaseUrl as String) + "api/customers/" + body['id']
                                 body
                             </groovy>
-            </script>
+            </setBody>
             <marshal>
               <json library="Jackson"/>
             </marshal>
