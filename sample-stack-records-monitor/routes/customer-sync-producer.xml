@@ -82,7 +82,7 @@
           <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
           <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
           <setHeader name="watermark">
-            <simple>${body}</simple> 
+            <simple>${body}</simple>
           </setHeader>
           <!-- Source API expects a date_upd range filter: [start,end] in "yyyy-MM-dd HH:mm:ss" -->
           <setHeader name="rangeStart">
@@ -148,6 +148,11 @@
             <log loggingLevel="DEBUG" message="Enqueueing customer ${body}"/>
             <to uri="platform-queue://customers-sync-queue"/>
           </split>
+          <doCatch>
+            <exception>org.apache.camel.http.base.HttpOperationFailedException</exception>
+            <log loggingLevel="ERROR"                                                                                                                                                                                                                                                                                                                                              
+         message="Customer sync: kaynak API hata döndü. status=${exception.statusCode} url=${exception.uri} www-authenticate=${exception.responseHeaders[WWW-Authenticate]} body=${exception.responseBody}"/>
+          </doCatch>
           <doCatch>
             <exception>java.lang.Exception</exception>
             <log loggingLevel="ERROR" message="Customer sync polling failed: ${exception.message}"/>
