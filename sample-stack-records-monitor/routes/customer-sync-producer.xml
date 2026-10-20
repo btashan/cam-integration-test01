@@ -117,7 +117,7 @@
           <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
           <script>
             <groovy>
-                            def xml = new groovy.util.XmlSlurper().parseText(body as String)
+                            def xml = new groovy.xml.XmlSlurper().parseText(body as String)
                             def customers = xml.customers.customer.collect { c -&gt;
                                 def map = [:]
                                 c.children().each { field -&gt;
