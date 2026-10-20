@@ -1,6 +1,4 @@
-<!-- DEPS com.camelyne:platform-components:0.2 component="platform-queue,platform-state" -->
-<!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" -->
-<routes xmlns="http://camel.apache.org/schema/spring">
+<!-- DEPS com.camelyne:platform-components:0.2 component="platform-queue,platform-state" --><!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" --><routes xmlns="http://camel.apache.org/schema/spring">
   <!--
       Customer Sync - Consumer (push-based queue -> Odoo upsert)
       ============================================================
