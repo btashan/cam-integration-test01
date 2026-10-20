@@ -86,7 +86,7 @@
       <log loggingLevel="DEBUG" message="Transformed Odoo partner vals: ${body}"/>
       <!-- normalize the Odoo base URL the same way the producer normalizes PRESTA_BASE_URL -->
       <setHeader name="odooUrl">
-        <simple>{{vars.ODOO_BASE_URL}}}}</simple>
+        <simple>{{vars.ODOO_BASE_URL}}</simple>
       </setHeader>
       <setHeader name="odooUrl">
         <groovy>(headers.odooUrl as String).replaceAll('/+$', '') + '/'</groovy>
