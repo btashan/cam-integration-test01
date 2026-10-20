@@ -94,6 +94,8 @@
           <setHeader name="rangeEnd">
             <simple>${date:now:yyyy-MM-dd HH:mm:ss}</simple>
           </setHeader>
+          <removeHeaders pattern="*" excludePattern="watermark|rangeStart|rangeEnd"/> 
+          <removeHeaders pattern="CamelHttp*"/> 
           <setHeader name="CamelHttpMethod">
             <constant>GET</constant>
           </setHeader>
