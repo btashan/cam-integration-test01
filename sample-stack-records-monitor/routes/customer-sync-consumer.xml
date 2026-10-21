@@ -42,7 +42,7 @@
       the watermark per successfully processed record is safe.
     -->
   <route id="customer-sync-consumer">
-    <from uri="platform-queue://customers-sync-queue"/>
+    <from uri="platform-queue://customers-sync-queue?mode=pull"/>
     <log loggingLevel="INFO" message="Customer sync consumer received: ${body}"/>
     <!-- keep the raw message around so we can push it, unchanged, to the DLQ on failure -->
     <setProperty name="rawJson">
