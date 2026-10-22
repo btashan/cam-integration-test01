@@ -62,7 +62,6 @@
                     def firstname = (p.firstname ?: '').toString().trim()
                     def lastname = (p.lastname ?: '').toString().trim()
                     def fullName = [firstname, lastname].findAll { it }.join(' ')
-                    def birthday = (p.birthday &amp;&amp; p.birthday != '0000-00-00') ? p.birthday : null
                     def vals = [
                         ref         : "PRESTA-${p.id}".toString(),
                         name        : fullName ?: (p.email ?: "PRESTA-${p.id}".toString()),
@@ -71,8 +70,7 @@
                         comment     : p.note ?: null,
                         company_name: (p.company ?: null),
                         is_company  : (p.company ? true : false),
-                        active      : (p.active == '1'),
-                        birthday    : birthday
+                        active      : (p.active == '1')
                     ]
                     // Odoo's ORM wants `false`, not JSON null, for "no value"
                     vals.collectEntries { k, v -&gt; [k, (v == null ? false : v)] }
