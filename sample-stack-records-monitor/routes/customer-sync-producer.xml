@@ -1,7 +1,5 @@
-<!-- DEPS com.camelyne:platform-components:0.2 -->
-<!-- COMPONENT platform-timer -->
-<routes xmlns="http://camel.apache.org/schema/spring">
-  <!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue" -->
+<!-- DEPS com.camelyne:platform-components:0.2 --><!-- COMPONENT platform-timer --><routes xmlns="http://camel.apache.org/schema/spring">
+  <!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue,platform-lock" -->
   <!--
       Customer Sync - Producer (polling only, per scope of this task)
       ================================================================
@@ -15,11 +13,15 @@
       Uses Camelyne platform-native components instead of raw Camel
       ones:
         - platform-timer  -> cron scheduling (replaces camel-quartz)
+        - platform-lock   -> distributed mutex (atomic acquire/release
+                              with TTL), guarantees only one producer
+                              run is in flight at a time (replaces the
+                              old platform-state get+put flag, which
+                              had a race condition between the two
+                              calls)
         - platform-state  -> persisted key/value flags (replaces a
-                              local caffeine cache), used for both
-                              the mutex (is_customer_sync_running)
-                              and the watermark
-                              (last_successful_sync_timestamp)
+                              local caffeine cache), used for the
+                              watermark (last_successful_sync_timestamp)
         - platform-queue  -> pushes onto the platform QUEUE resource
                               (res_77ps5fhb). Adjust the queue
                               identifier below ("customers-sync-queue")
@@ -65,20 +67,16 @@
   <route id="customer-sync-producer">
     <from uri="platform-timer://customerSync?cron=*%2F1%20*%20*%20*%20*&amp;timeZone=UTC"/>
     <log loggingLevel="INFO" message="Customer sync tick started ${body}"/>
-    <!-- 1. Mutex guard: is a previous run still in progress? -->
-    <to uri="platform-state://is_customer_sync_running?operation=get"/>
+    <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
+             TTL auto-expires the lock after 10 min in case the worker crashes. -->
+    <to uri="platform-lock://customer-sync?operation=acquire&amp;ttl=600000"/>
     <choice>
       <when>
-        <simple>${body} == 'true'</simple>
-        <log loggingLevel="INFO" message="Entegrasyon zaten çalışıyor, bu tetikleme atlanıyor (is_customer_sync_running=true)"/>
+        <simple>${body} == 'false'</simple>
+        <log loggingLevel="INFO" message="Entegrasyon zaten çalışıyor, bu tetikleme atlanıyor (customer-sync lock alınamadı)"/>
       </when>
       <otherwise>
         <doTry>
-          <!-- acquire the lock; TTL expires it after 10 min in case the worker crashes -->
-          <setBody>
-            <constant>true</constant>
-          </setBody>
-          <to uri="platform-state://is_customer_sync_running?operation=put"/>
           <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
           <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
           <setHeader name="watermark">
@@ -152,19 +150,15 @@
           </split>
           <doCatch>
             <exception>org.apache.camel.http.base.HttpOperationFailedException</exception>
-            <log loggingLevel="ERROR"                                                                                                                                                                                                                                                                                                                                              
-         message="Customer sync: kaynak API hata döndü. status=${exception.statusCode} url=${exception.uri} www-authenticate=${exception.responseHeaders[WWW-Authenticate]} body=${exception.responseBody}"/>
+            <log loggingLevel="ERROR" message="Customer sync: kaynak API hata döndü. status=${exception.statusCode} url=${exception.uri} www-authenticate=${exception.responseHeaders[WWW-Authenticate]} body=${exception.responseBody}"/>
           </doCatch>
           <doCatch>
             <exception>java.lang.Exception</exception>
             <log loggingLevel="ERROR" message="Customer sync polling failed: ${exception.message}"/>
           </doCatch>
           <doFinally>
-            <!-- 4. Always release the mutex, success or failure -->
-            <setBody>
-              <constant>false</constant>
-            </setBody>
-            <to uri="platform-state://is_customer_sync_running?operation=put"/>
+            <!-- 4. Always release the lock, success or failure -->
+            <to uri="platform-lock://customer-sync?operation=release"/>
           </doFinally>
         </doTry>
       </otherwise>
