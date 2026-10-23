@@ -69,7 +69,7 @@
     <log loggingLevel="INFO" message="Customer sync tick started ${body}"/>
     <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
              TTL auto-expires the lock after 10 min in case the worker crashes. -->
-    <to uri="platform-lock://customer-sync?operation=acquire&amp;ttl=600000"/>
+    <to uri="platform-lock://customer-sync?operation=acquire"/>
     <choice>
       <when>
         <simple>${body} == 'false'</simple>
