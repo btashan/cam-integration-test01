@@ -79,7 +79,7 @@
       <setProperty name="odooPartner">
         <simple>${body}</simple>
       </setProperty>
-      <log loggingLevel="DEBUG" message="Transformed Odoo partner vals: ${body}"/>
+      <log loggingLevel="INFO" message="Transformed Odoo partner vals: ${body}"/>
       <!-- normalize the Odoo base URL the same way the producer normalizes PRESTA_BASE_URL -->
       <setHeader name="odooUrl">
         <simple>{{vars.ODOO_BASE_URL}}</simple>
@@ -121,6 +121,7 @@
         <constant>POST</constant>
       </setHeader>
       <toD uri="${header.odooUrl}jsonrpc"/>
+            <log loggingLevel="INFO" message="Invoked Odoo API : ${body}"/>
       <unmarshal>
         <json library="Jackson"/>
       </unmarshal>
