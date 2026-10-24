@@ -79,6 +79,7 @@
         <doTry>
           <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
           <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
+              <log loggingLevel="INFO" message="Islem basladi musteri kayitlari cekilecek..."/>
           <setHeader name="watermark">
             <simple>${body}</simple>
           </setHeader>
@@ -145,7 +146,7 @@
             <marshal>
               <json library="Jackson"/>
             </marshal>
-            <log loggingLevel="DEBUG" message="Enqueueing customer ${body}"/>
+            <log loggingLevel="INFO" message="Enqueueing customer ${body}"/>
             <to uri="platform-queue://customers-sync-queue"/>
           </split>
           <doCatch>
