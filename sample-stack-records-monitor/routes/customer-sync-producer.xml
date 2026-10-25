@@ -65,7 +65,7 @@
       forwarded to the queue, without hardcoding a fixed field list.
     -->
   <route id="customer-sync-producer">
-    <from uri="platform-timer://customerSync?cron=*%2F1%20*%20*%20*%20*&amp;timeZone=UTC"/>
+    <from uri="platform-timer://customerSync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
     <log loggingLevel="INFO" message="Customer sync tick started ${body}"/>
     <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
              TTL auto-expires the lock after 10 min in case the worker crashes. -->
