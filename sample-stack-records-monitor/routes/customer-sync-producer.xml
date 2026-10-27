@@ -1,85 +1,21 @@
 <!-- DEPS com.camelyne:platform-components:0.2 --><!-- COMPONENT platform-timer --><routes xmlns="http://camel.apache.org/schema/spring">
   <!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue,platform-lock" -->
-  <!--
-      Customer Sync - Producer (polling only, per scope of this task)
-      ================================================================
-      Runs every 5 minutes, finds customer records created OR updated
-      after the last watermark, and pushes them in strict chronological
-      order onto "customers-sync-queue" with their FULL field set (rich
-      payload), so this is a true full-sync producer (inserts + updates).
-      The consumer (upsert + watermark advance) is intentionally NOT
-      part of this route.
-
-      Uses Camelyne platform-native components instead of raw Camel
-      ones:
-        - platform-timer  -> cron scheduling (replaces camel-quartz)
-        - platform-lock   -> distributed mutex (atomic acquire/release
-                              with TTL), guarantees only one producer
-                              run is in flight at a time (replaces the
-                              old platform-state get+put flag, which
-                              had a race condition between the two
-                              calls)
-        - platform-state  -> persisted key/value flags (replaces a
-                              local caffeine cache), used for the
-                              watermark (last_successful_sync_timestamp)
-        - platform-queue  -> pushes onto the platform QUEUE resource
-                              (res_77ps5fhb). Adjust the queue
-                              identifier below ("customers-sync-queue")
-                              if the resource's code differs.
-
-      Source connector: real endpoint confirmed, returns XML (NOT JSON):
-        - GET http://34.156.146.117:8080/api/customers
-          ?date=1&filter[date_upd]=[start,end]&display=full
-          (range filter, "yyyy-MM-dd HH:mm:ss"); start = watermark,
-          end = now (UTC).
-          filter is on date_upd (not date_add) on purpose: in
-          PrestaShop date_upd is also stamped at creation time, so a
-          single filter on date_upd catches BOTH new and modified
-          customers -> full sync with one query.
-          display=full is required so the list call returns the
-          complete <customer> element (all fields), not just the
-          id/xlink:href stub.
-        - Auth: Basic, value kept as integration secret
-          "PRESTA_API_KEY" (set it under the Secrets tab), referenced
-          here as {{secrets.PRESTA_API_KEY}} — never hardcode the
-          credential in this file.
-        - last_successful_sync_timestamp is only READ here (UTC
-          ISO-8601 string); the future consumer route is the one
-          that advances it via platform-state after a successful
-          upsert.
-
-      Response shape example (customers wrapped under <prestashop>):
-        <prestashop xmlns:xlink="...">
-          <customers>
-            <customer>
-              <id>1</id>
-              <date_add>2024-01-01 10:00:00</date_add>
-              <date_upd>2024-05-01 12:00:00</date_upd>
-              <email>...</email>
-              ... (other fields depending on PrestaShop config)
-            </customer>
-          </customers>
-        </prestashop>
-      Fields are parsed dynamically with Groovy's XmlSlurper below, so
-      every field PrestaShop returns is kept as-is (rich payload) and
-      forwarded to the queue, without hardcoding a fixed field list.
-    -->
   <route id="customer-sync-producer">
     <from uri="platform-timer://customerSync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
-    <log loggingLevel="INFO" message="Customer sync tick started ${body}"/>
+    <log loggingLevel="INFO" message="Customer sync tick started..."/>
     <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
              TTL auto-expires the lock after 10 min in case the worker crashes. -->
     <to uri="platform-lock://customer-sync?operation=acquire"/>
     <choice>
       <when>
         <simple>${body} == 'false'</simple>
-        <log loggingLevel="INFO" message="Entegrasyon zaten çalışıyor, bu tetikleme atlanıyor (customer-sync lock alınamadı)"/>
+        <log loggingLevel="INFO" message="Integration is already running, skipping this trigger (could not acquire customer-sync lock)"/>
       </when>
       <otherwise>
         <doTry>
           <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
           <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
-              <log loggingLevel="INFO" message="Islem basladi musteri kayitlari cekilecek..."/>
+          <log loggingLevel="INFO" message="Process started, fetching customer records..."/>
           <setHeader name="watermark">
             <simple>${body}</simple>
           </setHeader>
@@ -115,7 +51,7 @@
           <toD uri="${header.prestaBaseUrl}api/customers?date=1&amp;filter[date_upd]=[${header.rangeStart},${header.rangeEnd}]&amp;display=full"/>
           <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
           <convertBodyTo type="java.lang.String"/>
-          <log loggingLevel="INFO" message="Presta response (ilk 300 karakter): ${body.substring(0, 300)}"/>
+          <log loggingLevel="INFO" message="Presta response (first 300 characters): ${body.substring(0, 300)}"/>
           <setBody>
             <groovy>
                             def xml = new groovy.xml.XmlSlurper().parseText(body as String)
