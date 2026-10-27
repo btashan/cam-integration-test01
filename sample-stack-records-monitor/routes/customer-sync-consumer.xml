@@ -157,7 +157,7 @@
                             ]
                         </groovy>
           </setBody>
-          <log loggingLevel="INFO" message="Odoo res.partner id=${exchangeProperty.odooExistingId} güncelleniyor (ref=${exchangeProperty.odooPartner[ref]})"/>
+          <log loggingLevel="INFO" message="Updating Odoo res.partner id=${exchangeProperty.odooExistingId} (ref=${exchangeProperty.odooPartner[ref]})"/>
         </when>
         <otherwise>
           <setBody>
@@ -181,7 +181,7 @@
                             ]
                         </groovy>
           </setBody>
-          <log loggingLevel="INFO" message="Yeni Odoo res.partner oluşturuluyor (ref=${exchangeProperty.odooPartner[ref]})"/>
+          <log loggingLevel="INFO" message="Creating new Odoo res.partner (ref=${exchangeProperty.odooPartner[ref]})"/>
         </otherwise>
       </choice>
       <marshal>
@@ -226,4 +226,5 @@
       </doCatch>
     </doTry>
   </route>
+  
 </routes>
