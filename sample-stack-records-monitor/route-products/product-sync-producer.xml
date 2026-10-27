@@ -1,0 +1,160 @@
+<!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-lock,platform-state,platform-queue" --><!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" --><routes xmlns="http://camel.apache.org/schema/spring">
+  <!--
+      Product Sync - Producer (Odoo poll -> ordered queue -> PrestaShop)
+      ============================================================
+      Every 5 minutes, polls Odoo's product.template model for records
+      whose write_date is newer than the stored watermark, and pushes
+      ONE lightweight reference message per product (id + write_date +
+      resource URL) onto "odoo-prestashop-product-sync-queue", in
+      strict ascending write_date order. The full product payload is
+      fetched later by the consumer (route-products/product-sync-consumer.xml)
+      so the message stays small and always reflects the latest state
+      at processing time.
+
+      Concurrency guard (is_odoo_product_sync_running):
+        Implemented via platform-lock (atomic acquire/release, TTL
+        auto-expires after 10 min so a crashed worker can never
+        deadlock future runs) instead of a plain boolean flag, to
+        avoid get+set race conditions. Lock key: "odoo-product-sync".
+
+      Watermark:
+        Stored under platform-state key
+        "product_sync_last_successful_timestamp" (UTC ISO-8601).
+        NOTE: deliberately NOT named "last_successful_sync_timestamp"
+        to avoid colliding with the unrelated customer-sync watermark
+        that may live in the same integration's shared state store.
+        It is advanced by the CONSUMER, only after a successful
+        PrestaShop upsert, using the processed record's write_date -
+        never by this producer - so a crash between enqueue and
+        consume never silently skips a record.
+
+      Resource wiring / variables & secrets (Designer > Variables/Secrets):
+        - vars.ODOO_BASE_URL     e.g. https://my-odoo.example.com/
+        - vars.ODOO_DB           Odoo database name
+        - vars.ODOO_UID          numeric uid of the API/service user
+        - secrets.ODOO_API_KEY   Odoo API key / password for that uid
+        - A queue resource "odoo-prestashop-product-sync-queue" must
+          exist and be bound below (adjust the URI if its code differs).
+    -->
+  <route id="product-sync-producer">
+    <from uri="platform-timer://odooProductSync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
+    <log loggingLevel="INFO" message="Odoo product sync tick started..."/>
+    <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+set race.
+             TTL auto-expires the lock after 10 min in case the worker crashes
+             mid-poll, which is exactly what "is_odoo_product_sync_running"
+             needs to never deadlock. -->
+    <to uri="platform-lock://odoo-product-sync?operation=acquire"/>
+    <choice>
+      <when>
+        <simple>${body} == 'false'</simple>
+        <log loggingLevel="INFO" message="Product sync is already running, skipping this trigger (could not acquire odoo-product-sync lock)"/>
+      </when>
+      <otherwise>
+        <doTry>
+          <!-- 2. Read the watermark and build the Odoo domain filter -->
+          <to uri="platform-state://product_sync_last_successful_timestamp?operation=get"/>
+          <setHeader name="watermark">
+            <simple>${body}</simple>
+          </setHeader>
+          <!-- Odoo stores/returns datetime fields in UTC as "yyyy-MM-dd HH:mm:ss" -->
+          <setHeader name="rangeStart">
+            <groovy>
+                        def w = request.headers['watermark'] as String
+                        (w ? java.time.OffsetDateTime.parse(w) : java.time.OffsetDateTime.parse('1970-01-01T00:00:00Z'))
+                            .format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))
+                    </groovy>
+          </setHeader>
+          <removeHeaders pattern="*" excludePattern="watermark|rangeStart"/>
+          <!-- normalize the Odoo base URL: strip trailing slashes, add exactly one -->
+          <setHeader name="odooUrl">
+            <simple>{{vars.ODOO_BASE_URL}}</simple>
+          </setHeader>
+          <setHeader name="odooUrl">
+            <groovy>(headers.odooUrl as String).replaceAll('/+$', '') + '/'</groovy>
+          </setHeader>
+          <!-- 3. Search Odoo for product.template records updated after the watermark,
+                         already requesting them in ascending write_date order (FIFO) -->
+          <setBody>
+            <groovy>
+                        [
+                            jsonrpc: "2.0",
+                            method : "call",
+                            params : [
+                                service: "object",
+                                method : "execute_kw",
+                                args   : [
+                                    "{{vars.ODOO_DB}}",
+                                    Integer.parseInt("{{vars.ODOO_UID}}"),
+                                    "{{secrets.ODOO_API_KEY}}",
+                                    "product.template",
+                                    "search_read",
+                                    [[["write_date", "&gt;", headers.rangeStart]]],
+                                    [
+                                        "fields": ["id", "write_date"],
+                                        "order" : "write_date asc"
+                                    ]
+                                ]
+                            ]
+                        ]
+                    </groovy>
+          </setBody>
+          <marshal>
+            <json library="Jackson"/>
+          </marshal>
+          <removeHeaders pattern="CamelHttp*"/>
+          <setHeader name="Content-Type">
+            <constant>application/json</constant>
+          </setHeader>
+          <setHeader name="CamelHttpMethod">
+            <constant>POST</constant>
+          </setHeader>
+          <toD uri="${header.odooUrl}jsonrpc"/>
+          <unmarshal>
+            <json library="Jackson"/>
+          </unmarshal>
+          <setBody>
+            <groovy>
+                        def res = (body as Map)?.result ?: []
+                        // Belt-and-braces: guarantee strict FIFO even if Odoo's "order" were ignored
+                        res.sort { it.write_date }
+                    </groovy>
+          </setBody>
+          <log loggingLevel="INFO" message="Fetched ${body.size()} created/updated Odoo product(s)"/>
+          <split>
+            <simple>${body}</simple>
+            <!-- Payload Structure: Odoo resource reference URL + the fields the
+                             consumer needs to order/advance the watermark; the consumer
+                             fetches the FULL product payload itself via this reference,
+                             so it is never stale by the time it is processed. -->
+            <setBody>
+              <groovy>
+                            [
+                                id       : body['id'],
+                                write_date: body['write_date'],
+                                url      : (headers.odooUrl as String) + "api/v1/products/" + body['id']
+                            ]
+                        </groovy>
+            </setBody>
+            <marshal>
+              <json library="Jackson"/>
+            </marshal>
+            <log loggingLevel="INFO" message="Enqueueing Odoo product ${body}"/>
+            <to uri="platform-queue://odoo-prestashop-product-sync-queue"/>
+          </split>
+          <doCatch>
+            <exception>org.apache.camel.http.base.HttpOperationFailedException</exception>
+            <log loggingLevel="ERROR" message="Odoo product sync: source API returned an error. status=${exception.statusCode} url=${exception.uri} body=${exception.responseBody}"/>
+          </doCatch>
+          <doCatch>
+            <exception>java.lang.Exception</exception>
+            <log loggingLevel="ERROR" message="Odoo product sync polling failed: ${exception.message}"/>
+          </doCatch>
+          <doFinally>
+            <!-- 4. Always release the lock / reset is_odoo_product_sync_running, success or failure -->
+            <to uri="platform-lock://odoo-product-sync?operation=release"/>
+          </doFinally>
+        </doTry>
+      </otherwise>
+    </choice>
+  </route>
+</routes>
