@@ -1,0 +1,189 @@
+<!-- DEPS com.camelyne:platform-components:0.2 component="platform-queue,platform-state" -->
+<!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" -->
+<!-- DEPS org.apache.camel:camel-base64:4.18.4 -->
+<routes xmlns="http://camel.apache.org/schema/spring">
+    <route id="shipment-sync-consumer">
+        <from uri="platform-queue://odoo-prestashop-shipment-notification-queue?mode=pull"/>
+
+        <onException>
+            <exception>java.lang.Exception</exception>
+            <redeliveryPolicy maximumRedeliveries="3" redeliveryDelay="1000" backOffMultiplier="2" useExponentialBackOff="true"/>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <log loggingLevel="ERROR" message="Shipment notification consumer failed after retries, sending to DLQ: ${exception.message}"/>
+            <setBody>
+                <simple>${exchangeProperty.rawJson}</simple>
+            </setBody>
+            <to uri="platform-queue://odoo-prestashop-shipment-notification-dlq"/>
+        </onException>
+
+        <log loggingLevel="INFO" message="Shipment notification consumer received: ${body}"/>
+        <!-- keep the raw message around so we can push it, unchanged, to the DLQ on failure -->
+        <setProperty name="rawJson">
+            <simple>${body}</simple>
+        </setProperty>
+        <unmarshal>
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty name="queueRef">
+            <simple>${body}</simple>
+        </setProperty>
+
+        <!-- normalize base URLs the same way order-sync-producer/consumer.xml do -->
+        <setHeader name="odooUrl">
+            <simple>{{vars.ODOO_BASE_URL}}</simple>
+        </setHeader>
+        <setHeader name="odooUrl">
+            <groovy>(headers.odooUrl as String).replaceAll('/+$', '') + '/'</groovy>
+        </setHeader>
+        <setHeader name="prestaUrl">
+            <simple>{{vars.PRESTA_BASE_URL}}</simple>
+        </setHeader>
+        <setHeader name="prestaUrl">
+            <groovy>(headers.prestaUrl as String).replaceAll('/+$', '') + '/'</groovy>
+        </setHeader>
+
+        <!-- PrestaShop Webservice auth: API key as Basic auth username, empty password -->
+        <setHeader name="Authorization">
+            <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
+        </setHeader>
+
+        <!-- 1. Resolve the Odoo sale.order's client_order_ref. The decision of
+                 "found vs not found -> throw" lives HERE, in the top-level route,
+                 not inside a direct: helper - see ORDER-DELIVERY-SYNC.md's design
+                 note on why the legacy route keeps that decision at the caller. -->
+        <setBody>
+            <groovy>
+                [
+                jsonrpc: "2.0",
+                method : "call",
+                params : [
+                service: "object",
+                method : "execute_kw",
+                args   : [
+                "{{vars.ODOO_DB}}",
+                Integer.parseInt("{{vars.ODOO_UID}}"),
+                "{{secrets.ODOO_API_KEY}}",
+                "sale.order",
+                "search_read",
+                [[["id", "=", (exchangeProperty.queueRef as Map).saleOrderId]]],
+                ["fields": ["id", "client_order_ref"], "limit": 1]
+                ]
+                ]
+                ]
+            </groovy>
+        </setBody>
+        <marshal>
+            <json library="Jackson"/>
+        </marshal>
+        <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+        <setHeader name="Content-Type">
+            <constant>application/json</constant>
+        </setHeader>
+        <setHeader name="CamelHttpMethod">
+            <constant>POST</constant>
+        </setHeader>
+        <log loggingLevel="INFO" message="Odoo jsonrpc request (sale.order.search_read by id): ${bodyAs(String)}"/>
+        <toD uri="${header.odooUrl}jsonrpc"/>
+        <unmarshal>
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty name="odooClientOrderRef">
+            <groovy>
+                def res = (body as Map)?.result ?: []
+                res.size() > 0 ? res[0].client_order_ref : null
+            </groovy>
+        </setProperty>
+
+        <choice>
+            <when>
+                <simple>${exchangeProperty.odooClientOrderRef} == null</simple>
+                <throwException exceptionType="java.lang.IllegalStateException"
+                                message="Odoo sale.order bulunamadi: id=${exchangeProperty.queueRef[saleOrderId]}, pickingId=${exchangeProperty.queueRef[id]}"/>
+            </when>
+            <when>
+                <!-- stray/manually-created Odoo sale order on this picking - not an
+                     error, just nothing to tell PrestaShop (mirrors legacy's
+                     odoo2ps-applyDeliveryState validation branch). -->
+                <simple>${exchangeProperty.odooClientOrderRef} !regex '^PS-.+'</simple>
+                <log loggingLevel="WARN" message="Gecersiz/taninmayan client_order_ref, PrestaShop guncellemesi atlaniyor: ${exchangeProperty.odooClientOrderRef}"/>
+            </when>
+            <otherwise>
+                <!-- 2. order-sync-consumer.xml sets client_order_ref = "PS-" + PrestaShop
+                         "reference" (NOT "PS-" + id like the legacy route did), so
+                         stripping the "PS-" prefix here yields the reference STRING,
+                         not a numeric id - one extra PrestaShop lookup is needed to
+                         resolve the numeric id_order that order_histories requires. -->
+                <setProperty name="prestashopReference">
+                    <simple>${exchangeProperty.odooClientOrderRef.substring(3)}</simple>
+                </setProperty>
+
+                <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+                <setHeader name="debugRequestUrl">
+                    <simple>${header.prestaUrl}api/orders?filter[reference]=[${exchangeProperty.prestashopReference}]&amp;output_format=JSON</simple>
+                </setHeader>
+                <log loggingLevel="INFO" message="PrestaShop orders request (reference lookup): ${header.debugRequestUrl}"/>
+                <toD uri="${header.debugRequestUrl}"/>
+                <log loggingLevel="INFO" message="PrestaShop orders response (reference lookup): ${body}"/>
+                <unmarshal>
+                    <json library="Jackson"/>
+                </unmarshal>
+                <setProperty name="prestashopOrderId">
+                    <groovy>
+                        // same single-object-vs-list normalization as order-sync-producer.xml:
+                        // PrestaShop collapses "orders" to a single object (not a list)
+                        // when exactly one order matches, and returns a bare empty
+                        // array ("[]") - not {"orders": []} - when nothing matches.
+                        def raw = (body instanceof Map) ? body.orders : null
+                        def res = raw == null ? [] : (raw instanceof List ? raw : [raw])
+                        res.size() > 0 ? res[0].id : null
+                    </groovy>
+                </setProperty>
+
+                <choice>
+                    <when>
+                        <simple>${exchangeProperty.prestashopOrderId} == null</simple>
+                        <throwException exceptionType="java.lang.IllegalStateException"
+                                        message="PrestaShop'ta reference bulunamadi: reference=${exchangeProperty.prestashopReference}, odooClientOrderRef=${exchangeProperty.odooClientOrderRef}"/>
+                    </when>
+                </choice>
+
+                <!-- 3. Write the "shipped/dispatched" status back to PrestaShop -
+                         state-only, same inline XML <simple> template shape as
+                         order-sync-consumer.xml step 9 (no order_carriers/tracking
+                         fields exist anywhere in this codebase, see
+                         ORDER-DELIVERY-SYNC.md). -->
+                <setBody>
+                    <simple>&lt;prestashop xmlns:xlink="http://www.w3.org/1999/xlink"&gt;&lt;order_history&gt;&lt;id_order&gt;${exchangeProperty.prestashopOrderId}&lt;/id_order&gt;&lt;id_order_state&gt;{{vars.PRESTA_ORDER_STATE_SHIPPED}}&lt;/id_order_state&gt;&lt;/order_history&gt;&lt;/prestashop&gt;</simple>
+                </setBody>
+                <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+                <setHeader name="Content-Type">
+                    <constant>text/xml</constant>
+                </setHeader>
+                <setHeader name="CamelHttpMethod">
+                    <constant>POST</constant>
+                </setHeader>
+                <toD uri="${header.prestaUrl}api/order_histories"/>
+                <!-- convertBodyTo: no unmarshal follows this call, so without this the
+                     body would stay an unreadable InputStreamCache in any later
+                     log/debug dump (same fix just applied to order-sync-consumer.xml). -->
+                <convertBodyTo type="java.lang.String"/>
+                <log loggingLevel="INFO" message="PrestaShop order_histories response: ${body}"/>
+                <log loggingLevel="INFO" message="PrestaShop siparisi 'shipped' olarak isaretlendi: prestashopOrderId=${exchangeProperty.prestashopOrderId} reference=${exchangeProperty.prestashopReference} newStateId={{vars.PRESTA_ORDER_STATE_SHIPPED}}"/>
+            </otherwise>
+        </choice>
+
+        <!-- 4. Advance OUR OWN "last successfully synced" watermark, using this
+                 item's own Odoo picking id - two-watermark design, consistent with
+                 the rest of this repo. Advanced regardless of which branch above
+                 ran (found-and-notified, or validly-skipped stray order) - both are
+                 "successfully handled", only an actual exception (missing sale
+                 order / missing PrestaShop reference) should leave this watermark
+                 behind and go to the DLQ for investigation. -->
+        <setBody>
+            <simple>${exchangeProperty.queueRef[id]}</simple>
+        </setBody>
+        <to uri="platform-state://odoo_shipment_notification_last_successful_id?operation=put"/>
+    </route>
+</routes>
