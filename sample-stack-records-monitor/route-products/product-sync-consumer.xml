@@ -1,241 +1,202 @@
 <!-- DEPS com.camelyne:platform-components:0.2 component="platform-queue,platform-state" -->
 <!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" -->
+<!-- DEPS org.apache.camel:camel-base64:4.18.4 -->
 <routes xmlns="http://camel.apache.org/schema/spring">
-  <!--
-      Product Sync - Consumer (queue -> Odoo fetch -> PrestaShop upsert)
-      ============================================================
-      Reads ONE lightweight reference (id, write_date, resource url)
-      at a time from "odoo-prestashop-product-sync-queue" (pushed there,
-      in strict write_date order, by product-sync-producer.xml), fetches
-      the FULL product payload from Odoo, maps it to the PrestaShop Web
-      Service "product" schema, and upserts it via PrestaShop's REST API
-      (search by reference/SKU, then PUT or POST).
+    <route id="product-sync-consumer">
+        <from uri="platform-queue://odoo-prestashop-product-sync-queue?mode=pull"/>
 
-      Resilience:
-        - Up to 3 automatic retries (1s initial delay, x2 backoff) on
-          any exception, handled by the onException block below.
-        - After the 3 retries are exhausted, the ORIGINAL raw queue
-          message is forwarded unchanged to
-          "odoo-prestashop-product-sync-dlq" for manual inspection -
-          a bad record never blocks the rest of the queue.
+        <onException>
+            <exception>java.lang.Exception</exception>
+            <redeliveryPolicy maximumRedeliveries="3" redeliveryDelay="1000" backOffMultiplier="2" useExponentialBackOff="true"/>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <log loggingLevel="ERROR" message="Product sync consumer failed after retries, sending to DLQ: ${exception.message}"/>
+            <setBody>
+                <simple>${exchangeProperty.rawJson}</simple>
+            </setBody>
+            <to uri="platform-queue://odoo-prestashop-product-sync-dlq"/>
+        </onException>
 
-      Idempotency: PrestaShop products are looked up by `reference`
-      (set to "ODOO-<id>") before deciding PUT (update) vs POST
-      (create), so re-processing the same queue message (e.g. after
-      a crash before the watermark was advanced) is always safe.
+        <log loggingLevel="INFO" message="Product sync consumer received: ${body}"/>
+        <!-- keep the raw message around so we can push it, unchanged, to the DLQ on failure -->
+        <setProperty name="rawJson">
+            <simple>${body}</simple>
+        </setProperty>
+        <unmarshal>
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty name="queueRef">
+            <simple>${body}</simple>
+        </setProperty>
 
-      Odoo connection (Designer > Variables/Secrets):
-        - vars.ODOO_BASE_URL, vars.ODOO_DB, vars.ODOO_UID
-        - secrets.ODOO_API_KEY
+        <!-- normalize base URLs the same way the producer does -->
+        <setHeader name="odooUrl">
+            <simple>{{vars.ODOO_BASE_URL}}</simple>
+        </setHeader>
+        <setHeader name="odooUrl">
+            <groovy>(headers.odooUrl as String).replaceAll('/+$', '') + '/'</groovy>
+        </setHeader>
+        <setHeader name="prestaUrl">
+            <simple>{{vars.PRESTA_BASE_URL}}</simple>
+        </setHeader>
+        <setHeader name="prestaUrl">
+            <groovy>(headers.prestaUrl as String).replaceAll('/+$', '') + '/'</groovy>
+        </setHeader>
 
-      PrestaShop connection (Designer > Variables/Secrets):
-        - vars.PRESTA_BASE_URL   e.g. https://my-shop.example.com/
-        - secrets.PRESTA_API_KEY  PrestaShop Webservice key (used as
-                                   Basic auth username, empty password)
-
-      Watermark: after a successful upsert, this route advances the
-      shared platform-state key "product_sync_last_successful_timestamp"
-      to this record's write_date (already UTC ISO-8601 as returned by
-      Odoo's search_read), exactly as called out in
-      product-sync-producer.xml's comments. Because the producer
-      enqueues strictly in ascending write_date order, advancing the
-      watermark per successfully processed record is safe.
-    -->
-  <route id="product-sync-consumer">
-    <from uri="platform-queue://odoo-prestashop-product-sync-queue?mode=pull"/>
-
-    <onException>
-      <exception>java.lang.Exception</exception>
-      <redeliveryPolicy maximumRedeliveries="3" redeliveryDelay="1000" backOffMultiplier="2" useExponentialBackOff="true"/>
-      <handled>
-        <constant>true</constant>
-      </handled>
-      <log loggingLevel="ERROR" message="Product sync consumer failed after retries, sending to DLQ: ${exception.message}"/>
-      <setBody>
-        <simple>${exchangeProperty.rawJson}</simple>
-      </setBody>
-      <to uri="platform-queue://odoo-prestashop-product-sync-dlq"/>
-    </onException>
-
-    <log loggingLevel="INFO" message="Product sync consumer received: ${body}"/>
-    <!-- keep the raw message around so we can push it, unchanged, to the DLQ on failure -->
-    <setProperty name="rawJson">
-      <simple>${body}</simple>
-    </setProperty>
-    <unmarshal>
-      <json library="Jackson"/>
-    </unmarshal>
-    <setProperty name="queueRef">
-      <simple>${body}</simple>
-    </setProperty>
-
-    <!-- normalize base URLs the same way the producer does -->
-    <setHeader name="odooUrl">
-      <simple>{{vars.ODOO_BASE_URL}}</simple>
-    </setHeader>
-    <setHeader name="odooUrl">
-      <groovy>(headers.odooUrl as String).replaceAll('/+$', '') + '/'</groovy>
-    </setHeader>
-    <setHeader name="prestaUrl">
-      <simple>{{vars.PRESTA_BASE_URL}}</simple>
-    </setHeader>
-    <setHeader name="prestaUrl">
-      <groovy>(headers.prestaUrl as String).replaceAll('/+$', '') + '/'</groovy>
-    </setHeader>
-
-    <!-- 1. Fetch the FULL product payload from Odoo via JSON-RPC (read, by id) -->
-    <setBody>
-      <groovy>
+        <!-- 1. Fetch the FULL product payload from Odoo via JSON-RPC (read, by id) -->
+        <setBody>
+            <groovy>
                 def ref = exchangeProperty.queueRef as Map
                 [
-                    jsonrpc: "2.0",
-                    method : "call",
-                    params : [
-                        service: "object",
-                        method : "execute_kw",
-                        args   : [
-                            "{{vars.ODOO_DB}}",
-                            Integer.parseInt("{{vars.ODOO_UID}}"),
-                            "{{secrets.ODOO_API_KEY}}",
-                            "product.template",
-                            "read",
-                            [[ref.id]],
-                            ["fields": ["id", "default_code", "name", "list_price", "qty_available",
-                                        "categ_id", "description_sale", "image_1920", "write_date"]]
-                        ]
-                    ]
+                jsonrpc: "2.0",
+                method : "call",
+                params : [
+                service: "object",
+                method : "execute_kw",
+                args   : [
+                "{{vars.ODOO_DB}}",
+                Integer.parseInt("{{vars.ODOO_UID}}"),
+                "{{secrets.ODOO_API_KEY}}",
+                "product.template",
+                "read",
+                [[ref.id]],
+                ["fields": ["id", "default_code", "name", "list_price", "qty_available",
+                "categ_id", "description_sale", "image_1920", "write_date"]]
+                ]
+                ]
                 ]
             </groovy>
-    </setBody>
-    <marshal>
-      <json library="Jackson"/>
-    </marshal>
-    <removeHeaders pattern="CamelHttp*"/>
-    <setHeader name="Content-Type">
-      <constant>application/json</constant>
-    </setHeader>
-    <setHeader name="CamelHttpMethod">
-      <constant>POST</constant>
-    </setHeader>
-    <toD uri="${header.odooUrl}jsonrpc"/>
-    <unmarshal>
-      <json library="Jackson"/>
-    </unmarshal>
-    <setBody>
-      <groovy>
+        </setBody>
+        <marshal>
+            <json library="Jackson"/>
+        </marshal>
+        <removeHeaders pattern="CamelHttp*"/>
+        <setHeader name="Content-Type">
+            <constant>application/json</constant>
+        </setHeader>
+        <setHeader name="CamelHttpMethod">
+            <constant>POST</constant>
+        </setHeader>
+        <toD uri="${header.odooUrl}jsonrpc"/>
+        <unmarshal>
+            <json library="Jackson"/>
+        </unmarshal>
+        <setBody>
+            <groovy>
                 def res = (body as Map)?.result
                 if (!res || res.isEmpty()) {
-                    throw new RuntimeException("Odoo product.template id=${(exchangeProperty.queueRef as Map).id} not found (deleted after enqueue?)")
+                throw new RuntimeException("Odoo product.template id=${(exchangeProperty.queueRef as Map).id} not found (deleted after enqueue?)")
                 }
                 res[0]
             </groovy>
-    </setBody>
-    <setProperty name="odooProduct">
-      <simple>${body}</simple>
-    </setProperty>
-    <log loggingLevel="INFO" message="Fetched Odoo product: ${body}"/>
+        </setBody>
+        <setProperty name="odooProduct">
+            <simple>${body}</simple>
+        </setProperty>
+        <log loggingLevel="INFO" message="Fetched Odoo product: ${body}"/>
 
-    <!-- 2. Map Odoo fields -> PrestaShop "product" vals.
-                 - Price: Odoo list_price is tax-excluded float, PrestaShop expects
-                   a plain decimal string for price (tax-excluded, "price").
-                 - Description: Odoo's description_sale is already HTML; PrestaShop's
-                   `description` field also accepts HTML, so strip script/style tags
-                   as a minimal sanitization pass.
-                 - Stock: qty_available mapped to PrestaShop's quantity (requires
-                   stock management enabled on the shop / advanced stock management
-                   off; adjust if using PrestaShop's advanced stock management). -->
-    <setBody>
-      <groovy>
+        <!-- 2. Map Odoo fields -> PrestaShop "product" vals.
+                     - Price: Odoo list_price is tax-excluded float, PrestaShop expects
+                       a plain decimal string for price (tax-excluded, "price").
+                     - Description: Odoo's description_sale is already HTML; PrestaShop's
+                       `description` field also accepts HTML, so strip script/style tags
+                       as a minimal sanitization pass.
+                     - Stock: qty_available mapped to PrestaShop's quantity (requires
+                       stock management enabled on the shop / advanced stock management
+                       off; adjust if using PrestaShop's advanced stock management). -->
+        <setBody>
+            <groovy>
                 def p = exchangeProperty.odooProduct as Map
                 def rawDesc = (p.description_sale ?: '').toString()
                 def safeDesc = rawDesc.replaceAll(/(?is)&lt;(script|style)\b.*?&gt;.*?&lt;\/\1&gt;/, '')
                 [
-                    reference       : "ODOO-${p.id}".toString(),
-                    name            : (p.name ?: "ODOO-${p.id}".toString()),
-                    price           : (p.list_price ?: 0.0G).toString(),
-                    quantity        : (p.qty_available ?: 0).toInteger(),
-                    id_category_default: (p.categ_id instanceof List &amp;&amp; p.categ_id.size() &gt; 0) ? p.categ_id[0] : null,
-                    description     : safeDesc,
-                    active          : 1
+                reference       : "ODOO-${p.id}".toString(),
+                name            : (p.name ?: "ODOO-${p.id}".toString()),
+                price           : (p.list_price ?: 0.0G).toString(),
+                quantity        : (p.qty_available ?: 0).toInteger(),
+                id_category_default: (p.categ_id instanceof List &amp;&amp; p.categ_id.size() &gt; 0) ? p.categ_id[0] : null,
+                description     : safeDesc,
+                active          : 1
                 ]
             </groovy>
-    </setBody>
-    <setProperty name="prestaProduct">
-      <simple>${body}</simple>
-    </setProperty>
-    <log loggingLevel="INFO" message="Mapped PrestaShop product vals: ${body}"/>
+        </setBody>
+        <setProperty name="prestaProduct">
+            <simple>${body}</simple>
+        </setProperty>
+        <log loggingLevel="INFO" message="Mapped PrestaShop product vals: ${body}"/>
 
-    <!-- PrestaShop Webservice auth: API key as Basic auth username, empty password -->
-    <setHeader name="Authorization">
-      <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
-    </setHeader>
+        <!-- PrestaShop Webservice auth: API key as Basic auth username, empty password -->
+        <setHeader name="Authorization">
+            <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
+        </setHeader>
 
-    <!-- 3. Idempotency: look the product up by reference (SKU) to decide create vs update -->
-    <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
-    <setHeader name="CamelHttpMethod">
-      <constant>GET</constant>
-    </setHeader>
-    <toD uri="${header.prestaUrl}api/products?filter[reference]=${exchangeProperty.prestaProduct[reference]}&amp;output_format=JSON"/>
-    <unmarshal>
-      <json library="Jackson"/>
-    </unmarshal>
-    <setProperty name="prestaExistingId">
-      <groovy>
+        <!-- 3. Idempotency: look the product up by reference (SKU) to decide create vs update -->
+        <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+        <setHeader name="CamelHttpMethod">
+            <constant>GET</constant>
+        </setHeader>
+        <toD uri="${header.prestaUrl}api/products?filter[reference]=${exchangeProperty.prestaProduct[reference]}&amp;output_format=JSON"/>
+        <unmarshal>
+            <json library="Jackson"/>
+        </unmarshal>
+        <setProperty name="prestaExistingId">
+            <groovy>
                 def res = (body as Map)?.products
                 (res &amp;&amp; res.size() &gt; 0) ? res[0].id : null
             </groovy>
-    </setProperty>
+        </setProperty>
 
-    <!-- 4. Upsert: PUT (update) if found, POST (create) otherwise -->
-    <choice>
-      <when>
-        <simple>${exchangeProperty.prestaExistingId} != null</simple>
-        <setBody>
-          <simple>${exchangeProperty.prestaProduct}</simple>
-        </setBody>
-        <marshal>
-          <json library="Jackson"/>
-        </marshal>
-        <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
-        <setHeader name="Content-Type">
-          <constant>application/json</constant>
-        </setHeader>
-        <setHeader name="CamelHttpMethod">
-          <constant>PUT</constant>
-        </setHeader>
-        <log loggingLevel="INFO" message="Updating PrestaShop product id=${exchangeProperty.prestaExistingId} (reference=${exchangeProperty.prestaProduct[reference]})"/>
-        <toD uri="${header.prestaUrl}api/products/${exchangeProperty.prestaExistingId}"/>
-      </when>
-      <otherwise>
-        <setBody>
-          <simple>${exchangeProperty.prestaProduct}</simple>
-        </setBody>
-        <marshal>
-          <json library="Jackson"/>
-        </marshal>
-        <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
-        <setHeader name="Content-Type">
-          <constant>application/json</constant>
-        </setHeader>
-        <setHeader name="CamelHttpMethod">
-          <constant>POST</constant>
-        </setHeader>
-        <log loggingLevel="INFO" message="Creating new PrestaShop product (reference=${exchangeProperty.prestaProduct[reference]})"/>
-        <toD uri="${header.prestaUrl}api/products"/>
-      </otherwise>
-    </choice>
-    <log loggingLevel="INFO" message="PrestaShop upsert OK, result=${body}"/>
+        <!-- 4. Upsert: PUT (update) if found, POST (create) otherwise -->
+        <choice>
+            <when>
+                <simple>${exchangeProperty.prestaExistingId} != null</simple>
+                <setBody>
+                    <simple>${exchangeProperty.prestaProduct}</simple>
+                </setBody>
+                <marshal>
+                    <json library="Jackson"/>
+                </marshal>
+                <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+                <setHeader name="Content-Type">
+                    <constant>application/json</constant>
+                </setHeader>
+                <setHeader name="CamelHttpMethod">
+                    <constant>PUT</constant>
+                </setHeader>
+                <log loggingLevel="INFO" message="Updating PrestaShop product id=${exchangeProperty.prestaExistingId} (reference=${exchangeProperty.prestaProduct[reference]})"/>
+                <toD uri="${header.prestaUrl}api/products/${exchangeProperty.prestaExistingId}"/>
+            </when>
+            <otherwise>
+                <setBody>
+                    <simple>${exchangeProperty.prestaProduct}</simple>
+                </setBody>
+                <marshal>
+                    <json library="Jackson"/>
+                </marshal>
+                <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+                <setHeader name="Content-Type">
+                    <constant>application/json</constant>
+                </setHeader>
+                <setHeader name="CamelHttpMethod">
+                    <constant>POST</constant>
+                </setHeader>
+                <log loggingLevel="INFO" message="Creating new PrestaShop product (reference=${exchangeProperty.prestaProduct[reference]})"/>
+                <toD uri="${header.prestaUrl}api/products"/>
+            </otherwise>
+        </choice>
+        <log loggingLevel="INFO" message="PrestaShop upsert OK, result=${body}"/>
 
-    <!-- 5. Advance the shared watermark to this record's write_date
-                 (producer enqueues in ascending write_date order) -->
-    <setBody>
-      <groovy>
+        <!-- 5. Advance the shared watermark to this record's write_date
+                     (producer enqueues in ascending write_date order) -->
+        <setBody>
+            <groovy>
                 def p = exchangeProperty.odooProduct as Map
                 java.time.LocalDateTime.parse(p.write_date as String, java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))
-                    .atOffset(java.time.ZoneOffset.UTC)
-                    .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                .atOffset(java.time.ZoneOffset.UTC)
+                .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
             </groovy>
-    </setBody>
-    <to uri="platform-state://product_sync_last_successful_timestamp?operation=put"/>
-  </route>
+        </setBody>
+        <to uri="platform-state://product_sync_last_successful_timestamp?operation=put"/>
+    </route>
 </routes>
