@@ -1,7 +1,7 @@
 <!-- DEPS com.camelyne:platform-components:0.2 --><!-- COMPONENT platform-timer --><routes xmlns="http://camel.apache.org/schema/spring">
   <!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue,platform-lock" -->
   <route id="customer-sync-producer">
-    <from uri="platform-timer://customerSync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
+    <from uri="platform-timer://customer-Sync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
     <log loggingLevel="INFO" message="Customer sync tick started..."/>
     <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
              TTL auto-expires the lock after 10 min in case the worker crashes. -->
