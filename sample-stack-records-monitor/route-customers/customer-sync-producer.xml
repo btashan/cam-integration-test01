@@ -1,0 +1,104 @@
+<!-- DEPS com.camelyne:platform-components:0.2 --><!-- COMPONENT platform-timer --><routes xmlns="http://camel.apache.org/schema/spring">
+  <!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-state,platform-queue,platform-lock" -->
+  <route id="customer-sync-producer">
+    <from uri="platform-timer://customerSync?cron=0%2010%20*%20*%20*&amp;timeZone=UTC"/>
+    <log loggingLevel="INFO" message="Customer sync tick started..."/>
+    <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+put race.
+             TTL auto-expires the lock after 10 min in case the worker crashes. -->
+    <to uri="platform-lock://customer-sync?operation=acquire"/>
+    <choice>
+      <when>
+        <simple>${body} == 'false'</simple>
+        <log loggingLevel="INFO" message="Integration is already running, skipping this trigger (could not acquire customer-sync lock)"/>
+      </when>
+      <otherwise>
+        <doTry>
+          <!-- 2. Read the watermark and poll source for records created/updated after it (UTC ISO-8601) -->
+          <to uri="platform-state://last_successful_sync_timestamp?operation=get"/>
+          <log loggingLevel="INFO" message="Process started, fetching customer records..."/>
+          <setHeader name="watermark">
+            <simple>${body}</simple>
+          </setHeader>
+          <!-- Source API expects a date_upd range filter: [start,end] in "yyyy-MM-dd HH:mm:ss" -->
+          <setHeader name="rangeStart">
+            <!-- <groovy>java.time.OffsetDateTime.parse(request.headers['watermark'] as String).format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))</groovy> -->
+            <groovy>def w = request.headers['watermark'] as String                                                                                                                                                                                                                                                                                                                 
+        (w ? java.time.OffsetDateTime.parse(w) : java.time.OffsetDateTime.parse('1970-01-01T00:00:00Z'))                                                                                                                                                                                                                                                                         
+    .format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))</groovy>
+          </setHeader>
+          <setHeader name="rangeEnd">
+            <simple>${date:now:yyyy-MM-dd HH:mm:ss}</simple>
+          </setHeader>
+          <removeHeaders pattern="*" excludePattern="watermark|rangeStart|rangeEnd"/>
+          <removeHeaders pattern="CamelHttp*"/>
+          <setHeader name="CamelHttpMethod">
+            <constant>GET</constant>
+          </setHeader>
+          <!-- Basic auth value is stored as an integration secret, NOT hardcoded here -->
+          <setHeader name="Authorization">
+            <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
+          </setHeader>
+          <!-- Path concat safety: vars.PRESTA_BASE_URL may or may not end with "/".
+                         Camel has no built-in path-join, so normalize manually: strip any
+                         trailing slashes then add exactly one, so appending "api/customers"
+                         below never produces a missing or doubled slash. -->
+          <setHeader name="prestaBaseUrl">
+            <simple>{{vars.PRESTA_BASE_URL}}</simple>
+          </setHeader>
+          <setHeader name="prestaBaseUrl">
+            <groovy>(headers.prestaBaseUrl as String).replaceAll('/+$', '') + '/'</groovy>
+          </setHeader>
+          <toD uri="${header.prestaBaseUrl}api/customers?date=1&amp;filter[date_upd]=[${header.rangeStart},${header.rangeEnd}]&amp;display=full"/>
+          <!-- Response is PrestaShop XML, not JSON: parse dynamically so every field is kept (rich payload) -->
+          <convertBodyTo type="java.lang.String"/>
+          <log loggingLevel="INFO" message="Presta response (first 300 characters): ${body.substring(0, 300)}"/>
+          <setBody>
+            <groovy>
+                            def xml = new groovy.xml.XmlSlurper().parseText(body as String)
+                            def customers = xml.customers.customer.collect { c -&gt;
+                                def map = [:]
+                                c.children().each { field -&gt;
+                                    map[field.name()] = field.text()
+                                }
+                                map
+                            }
+                            // 3. Guarantee strict FIFO: sort ascending by date_upd before enqueueing
+                            customers.sort { it.date_upd }
+                            customers
+                        </groovy>
+          </setBody>
+          <log loggingLevel="INFO" message="Fetched ${body.size()} created/updated customer(s)"/>
+          <split>
+            <simple>${body}</simple>
+            <!-- Keep ALL fields PrestaShop returned (rich data) and add a convenience url
+                             pointing at the REAL source record (same base URL used to fetch it,
+                             split exchanges inherit headers from the parent, so prestaBaseUrl is available) -->
+            <setBody>
+              <groovy>
+                                body['url'] = (headers.prestaBaseUrl as String) + "api/customers/" + body['id']
+                                body
+                            </groovy>
+            </setBody>
+            <marshal>
+              <json library="Jackson"/>
+            </marshal>
+            <log loggingLevel="INFO" message="Enqueueing customer ${body}"/>
+            <to uri="platform-queue://customers-sync-queue"/>
+          </split>
+          <doCatch>
+            <exception>org.apache.camel.http.base.HttpOperationFailedException</exception>
+            <log loggingLevel="ERROR" message="Customer sync: kaynak API hata döndü. status=${exception.statusCode} url=${exception.uri} www-authenticate=${exception.responseHeaders[WWW-Authenticate]} body=${exception.responseBody}"/>
+          </doCatch>
+          <doCatch>
+            <exception>java.lang.Exception</exception>
+            <log loggingLevel="ERROR" message="Customer sync polling failed: ${exception.message}"/>
+          </doCatch>
+          <doFinally>
+            <!-- 4. Always release the lock, success or failure -->
+            <to uri="platform-lock://customer-sync?operation=release"/>
+          </doFinally>
+        </doTry>
+      </otherwise>
+    </choice>
+  </route>
+</routes>
