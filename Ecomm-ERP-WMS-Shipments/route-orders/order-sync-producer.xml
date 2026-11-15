@@ -1,0 +1,196 @@
+<!-- DEPS com.camelyne:platform-components:0.2 component="platform-timer,platform-lock,platform-state,platform-queue" -->
+<!-- DEPS org.apache.camel:camel-http:4.4.0 component="http" -->
+<!-- DEPS org.apache.camel:camel-base64:4.18.4 -->
+<routes xmlns="http://camel.apache.org/schema/spring">
+    <route id="order-sync-producer">
+        <from uri="platform-timer://prestashopOrderInjection?cron=*%2F5%20*%20*%20*%20*&amp;timeZone=UTC"/>
+        <log loggingLevel="INFO" message="PrestaShop order injection tick started..."/>
+        <!-- 1. Mutex guard via platform-lock: atomic acquire, no get+set race.
+                 TTL auto-expires the lock after 10 min in case the worker crashes
+                 mid-poll, which is exactly what "is_prestashop_order_injection_running"
+                 needs to never deadlock. -->
+        <to uri="platform-lock://prestashop-order-injection?operation=acquire"/>
+        <choice>
+            <when>
+                <simple>${body} == 'false'</simple>
+                <log loggingLevel="INFO" message="Order injection is already running, skipping this trigger (could not acquire prestashop-order-injection lock)"/>
+            </when>
+            <otherwise>
+                <doTry>
+                    <!-- 2. Read OUR OWN "last enqueued" watermark (NOT the consumer's
+                             "last successfully synced" one) and build the PrestaShop
+                             filter. Using our own watermark means that if the consumer
+                             is stopped/lagging and this route fires again before it
+                             catches up, we never re-fetch/re-enqueue the same orders -
+                             duplicate enqueues are avoided regardless of consumer state
+                             (same fix as product-sync-producer.xml). Items that fail
+                             downstream still go through the consumer's own retry/DLQ
+                             path, independent of this watermark.
+
+                             Watermark is the last ENQUEUED PrestaShop order id, not a
+                             date. PrestaShop's Webservice does not accept filtering by
+                             date_upd/invoice_date the way we need it to (confirmed
+                             against the real demo), so instead we rely on "id" being a
+                             plain sequential auto-increment: anything with
+                             id > lastEnqueuedId is new/unseen. -->
+                    <to uri="platform-state://prestashop_order_injection_last_enqueued_id?operation=get"/>
+                    <setHeader name="watermark">
+                        <simple>${body}</simple>
+                    </setHeader>
+                    <setHeader name="minId">
+                        <groovy>
+                            def w = request.headers['watermark'] as String
+                            (w ? (w as long) : 0L) + 1L
+                        </groovy>
+                    </setHeader>
+                    <removeHeaders pattern="*" excludePattern="watermark|minId"/>
+                    <!-- normalize the PrestaShop base URL: strip trailing slashes, add exactly one -->
+                    <setHeader name="prestaUrl">
+                        <simple>{{vars.PRESTA_BASE_URL}}</simple>
+                    </setHeader>
+                    <setHeader name="prestaUrl">
+                        <groovy>(headers.prestaUrl as String).replaceAll('/+$', '') + '/'</groovy>
+                    </setHeader>
+                    <!-- PrestaShop Webservice auth: API key as Basic auth username, empty password -->
+                    <setHeader name="Authorization">
+                        <simple>Basic ${base64Encode({{secrets.PRESTA_API_KEY}}:)}</simple>
+                    </setHeader>
+                    <!-- 3. Search PrestaShop for qualifying orders (valid/paid states, see
+                             vars.PRESTA_QUALIFYING_ORDER_STATES) updated after the
+                             watermark, PAGE BY PAGE until a non-full page comes back - so
+                             a backlog bigger than one page is fully drained in THIS tick,
+                             instead of waiting for the next cron fire to pick up the
+                             remainder. -->
+                    <setProperty name="pageSize">
+                        <constant>100</constant>
+                    </setProperty>
+                    <setProperty name="pageOffset">
+                        <constant>0</constant>
+                    </setProperty>
+                    <!-- sentinel so the FIRST loop check (evaluated BEFORE any iteration runs) passes -->
+                    <setProperty name="pageFetchedCount">
+                        <simple>${exchangeProperty.pageSize}</simple>
+                    </setProperty>
+                    <!-- tracks the max order id actually enqueued this tick, across
+                         all pages, so we can advance OUR OWN watermark after the loop -->
+                    <setProperty name="maxEnqueuedId">
+                        <groovy>null</groovy>
+                    </setProperty>
+                    <loop doWhile="true">
+                        <!-- keep paging while the LAST page came back full; a non-full (or
+                             empty) page means we reached the end of the backlog -->
+                        <simple>${exchangeProperty.pageFetchedCount} == ${exchangeProperty.pageSize}</simple>
+                    <removeHeaders pattern="CamelHttp*" excludePattern="Authorization"/>
+                    <!-- display=full gerekli: onsuz liste endpoint'i her siparis icin
+                         sadece id/href donduruyor, invoice_date gibi alanlar gelmiyor
+                         (gercek demo'ya karsi dogrulandi - bkz. kullanicinin calisan
+                         curl'u). PrestaShop Webservice filter[date_upd]/filter[invoice_date]
+                         beklendigi gibi calismadigi icin (gercek demo'ya karsi
+                         dogrulandi) checkpoint tarih alani DEGIL, id - siparis id'leri
+                         sequential/auto-increment oldugu icin filter[id]=[minId,max]
+                         range'i ile "minId'den buyuk/esit" filtrelemesi yapiyoruz. -->
+                    <setHeader name="debugRequestUrl">
+                        <simple>${header.prestaUrl}api/orders?display=full&amp;filter[id]=[${header.minId},999999999]&amp;filter[current_state]=[{{vars.PRESTA_QUALIFYING_ORDER_STATES}}]&amp;sort=id_ASC&amp;limit=${exchangeProperty.pageOffset},${exchangeProperty.pageSize}&amp;output_format=JSON</simple>
+                    </setHeader>
+                    <log loggingLevel="INFO" message="PrestaShop orders request (offset=${exchangeProperty.pageOffset}): ${header.debugRequestUrl}"/>
+                    <toD uri="${header.debugRequestUrl}"/>
+                    <log loggingLevel="INFO" message="PrestaShop orders response (offset=${exchangeProperty.pageOffset}): ${body}"/>
+                    <unmarshal>
+                        <json library="Jackson"/>
+                    </unmarshal>
+                    <setBody>
+                        <groovy>
+                            // "orders" comes back as a single object (not a list) when
+                            // exactly one order matches, and PrestaShop returns a bare
+                            // empty array ("[]") - not {"orders": []} - when NOTHING
+                            // matches the filter. Check instanceof Map explicitly instead
+                            // of blindly casting (body as Map), since (list as Map) on
+                            // that bare empty-array response blows up with a Groovy
+                            // MissingMethodException ("ArrayList.get() ... [orders]").
+                            def raw = (body instanceof Map) ? body.orders : null
+                            def res = raw == null ? [] : (raw instanceof List ? raw : [raw])
+                            // Belt-and-braces: guarantee strict FIFO even if the API's "sort" were ignored
+                            res.sort { (it.id as long) }
+                        </groovy>
+                    </setBody>
+                    <setProperty name="pageFetchedCount">
+                        <simple>${body.size()}</simple>
+                    </setProperty>
+                    <!-- body is sorted ascending by id, so its last element
+                         (if any) holds this page's max id -->
+                    <setProperty name="maxEnqueuedId">
+                        <groovy>
+                            def pageMax = (body as List) ? (body[-1]?.id as Long) : null
+                            def currentMax = exchangeProperty.maxEnqueuedId as Long
+                            (pageMax != null &amp;&amp; (currentMax == null || pageMax > currentMax)) ? pageMax : currentMax
+                        </groovy>
+                    </setProperty>
+                    <choice>
+                        <when>
+                            <simple>${exchangeProperty.pageFetchedCount} == 0</simple>
+                            <log loggingLevel="INFO" message="No new qualifying PrestaShop orders found (offset=${exchangeProperty.pageOffset}, minId=${header.minId})"/>
+                        </when>
+                        <otherwise>
+                            <log loggingLevel="INFO" message="Fetched ${exchangeProperty.pageFetchedCount} qualifying PrestaShop order(s) (offset=${exchangeProperty.pageOffset})"/>
+                        </otherwise>
+                    </choice>
+                    <split>
+                        <simple>${body}</simple>
+                        <!-- Payload Structure: PrestaShop order id + human-readable
+                             "reference" (e.g. "OQXTEKJMS") + resource URL; the consumer
+                             fetches the FULL order payload itself via this URL, so it is
+                             never stale by the time it is processed. "reference" is kept
+                             alongside "id" since it's the order code PrestaShop shows to
+                             customers/staff - useful both for lookups and as a more
+                             meaningful Odoo order number than the raw numeric id. -->
+                        <setBody>
+                            <groovy>
+                                [
+                                id           : body['id'],
+                                reference    : body['reference'],
+                                invoice_date : body['invoice_date'],
+                                url          : (headers.prestaUrl as String) + "api/orders/" + body['id']
+                                ]
+                            </groovy>
+                        </setBody>
+                        <marshal>
+                            <json library="Jackson"/>
+                        </marshal>
+                        <log loggingLevel="INFO" message="Enqueueing PrestaShop order ${body}"/>
+                        <to uri="platform-queue://prestashop-odoo-order-injection-queue"/>
+                    </split>
+                    <setProperty name="pageOffset">
+                        <groovy>(exchangeProperty.pageOffset as int) + (exchangeProperty.pageSize as int)</groovy>
+                    </setProperty>
+                    </loop>
+                    <choice>
+                        <when>
+                            <simple>${exchangeProperty.maxEnqueuedId} != null</simple>
+                            <!-- 3b. Advance OUR OWN "last enqueued" watermark (plain order id,
+                                     same storage key convention as the consumer's
+                                     success-watermark) so a producer run that fires again
+                                     before the consumer catches up never re-fetches/
+                                     re-enqueues what's already queued. -->
+                            <setBody>
+                                <simple>${exchangeProperty.maxEnqueuedId}</simple>
+                            </setBody>
+                            <to uri="platform-state://prestashop_order_injection_last_enqueued_id?operation=put"/>
+                        </when>
+                    </choice>
+                    <doCatch>
+                        <exception>org.apache.camel.http.base.HttpOperationFailedException</exception>
+                        <log loggingLevel="ERROR" message="PrestaShop order injection: source API returned an error. status=${exception.statusCode} url=${exception.uri} body=${exception.responseBody}"/>
+                    </doCatch>
+                    <doCatch>
+                        <exception>java.lang.Exception</exception>
+                        <log loggingLevel="ERROR" message="PrestaShop order injection polling failed: ${exception.message}"/>
+                    </doCatch>
+                    <doFinally>
+                        <!-- 4. Always release the lock / reset is_prestashop_order_injection_running, success or failure -->
+                        <to uri="platform-lock://prestashop-order-injection?operation=release"/>
+                    </doFinally>
+                </doTry>
+            </otherwise>
+        </choice>
+    </route>
+</routes>
